@@ -23,6 +23,7 @@ class ActionStep:
     actionType: str
     soldierId: int
     path: List[Point3D]
+    damageDealt: List[Dict[str, Any]]
 
 
 class GameDataDecoder:
@@ -64,8 +65,22 @@ class GameDataDecoder:
                 if not action_path:
                     action_path = []
                 path = [Point3D(x=int(p.get('x', 0)), y=int(p.get('y', 0)), z=int(p.get('z', 0))) for p in action_path]
-                actions.append(ActionStep(actionType=a.get('actionType', ''), soldierId=a.get('soldierId', -1), path=path))
-            rounds.append({'roundNumber': r.get('roundNumber', -1), 'actions': actions})
+                damage_dealt = a.get('damageDealt') if isinstance(a.get('damageDealt'), list) else []
+                actions.append(
+                    ActionStep(
+                        actionType=a.get('actionType', ''),
+                        soldierId=a.get('soldierId', -1),
+                        path=path,
+                        damageDealt=damage_dealt,
+                    )
+                )
+            rounds.append(
+                {
+                    'roundNumber': r.get('roundNumber', -1),
+                    'actions': actions,
+                    'stats': r.get('stats', []),
+                }
+            )
         return rounds
 
     @staticmethod

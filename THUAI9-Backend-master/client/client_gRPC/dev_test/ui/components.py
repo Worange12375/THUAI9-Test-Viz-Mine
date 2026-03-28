@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from collections.abc import Callable
-from typing import Sequence
+from typing import Any, Sequence
 from tkinter import ttk
 
 
@@ -419,9 +419,17 @@ class ChessboardPanel(ttk.LabelFrame):
 		self.board_origin_y = 0
 		self.board_pixel_size = 0
 		self.cell_size = 0.0
+		self.map_rows: list[list[int]] = []
+		self.pieces: list[dict[str, Any]] = []
 
 		# 监听尺寸变化：窗口拉伸时自动重绘，保持棋盘为正方形。
 		self.canvas.bind("<Configure>", self._on_canvas_resize)
+
+	def set_board_state(self, map_rows: list[list[int]] | None, pieces: list[dict[str, Any]] | None) -> None:
+		"""设置地图与棋子状态并触发重绘。"""
+		self.map_rows = map_rows if isinstance(map_rows, list) else []
+		self.pieces = pieces if isinstance(pieces, list) else []
+		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())
 
 	def _on_canvas_resize(self, event: tk.Event) -> None:
 		"""Canvas 尺寸变化时触发重绘。"""
@@ -456,6 +464,17 @@ class ChessboardPanel(ttk.LabelFrame):
 		x1 = x0 + self.board_pixel_size
 		y1 = y0 + self.board_pixel_size
 
+		# 先画 20x20 格子底色。
+		for row in range(self.board_grid_size):
+			for col in range(self.board_grid_size):
+				cell_value = self._get_map_value(col, row)
+				fill_color = "#B7E4C7" if cell_value == 1 else "#5B3A29"
+				cx0 = x0 + col * self.cell_size
+				cy0 = y0 + row * self.cell_size
+				cx1 = cx0 + self.cell_size
+				cy1 = cy0 + self.cell_size
+				self.canvas.create_rectangle(cx0, cy0, cx1, cy1, fill=fill_color, outline="")
+
 		# 先画棋盘外框，线条稍粗，便于与内部网格区分。
 		self.canvas.create_rectangle(x0, y0, x1, y1, outline="#1f2937", width=2)
 
@@ -472,10 +491,67 @@ class ChessboardPanel(ttk.LabelFrame):
 			hy = y0 + line_offset
 			self.canvas.create_line(x0, hy, x1, hy, fill="#9ca3af", width=1)
 
+		self._draw_pieces()
+
+	def _get_map_value(self, x: int, y: int) -> int:
+		"""获取地图格值。越界或缺失时按不可行处理。"""
+		if y < 0 or y >= len(self.map_rows):
+			return 0
+		row = self.map_rows[y]
+		if not isinstance(row, list) or x < 0 or x >= len(row):
+			return 0
+		value = row[x]
+		return value if isinstance(value, int) else 0
+
+	def _draw_pieces(self) -> None:
+		"""在对应格子绘制棋子与白字标注。"""
+		if self.cell_size <= 0:
+			return
+
+		for piece in self.pieces:
+			x = piece.get("x")
+			y = piece.get("y")
+			team = piece.get("team")
+			label = piece.get("label")
+			if not isinstance(x, int) or not isinstance(y, int):
+				continue
+			if x < 0 or y < 0 or x >= self.board_grid_size or y >= self.board_grid_size:
+				continue
+
+			cx0 = self.board_origin_x + x * self.cell_size
+			cy0 = self.board_origin_y + y * self.cell_size
+			cx1 = cx0 + self.cell_size
+			cy1 = cy0 + self.cell_size
+			piece_color = "#D62828" if team == 1 else "#1D4ED8"
+
+			pad = self.cell_size * 0.12
+			self.canvas.create_rectangle(
+				cx0 + pad,
+				cy0 + pad,
+				cx1 - pad,
+				cy1 - pad,
+				fill=piece_color,
+				outline="#111827",
+				width=1,
+			)
+
+			if isinstance(label, str) and label:
+				font_size = max(7, int(self.cell_size * 0.22))
+				self.canvas.create_text(
+					(cx0 + cx1) / 2,
+					(cy0 + cy1) / 2,
+					text=label,
+					fill="#FFFFFF",
+					font=("Microsoft YaHei UI", font_size, "bold"),
+					justify="center",
+				)
+
 	def reset_board_state(self) -> None:
 		"""重置棋盘到初始状态。
 
 		当前版本的棋盘仅包含网格，因此重置逻辑为“清空并重绘网格”。
 		后续若加入棋子/障碍绘制，可在这里统一清理并恢复初始局面。
 		"""
+		self.map_rows = []
+		self.pieces = []
 		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())

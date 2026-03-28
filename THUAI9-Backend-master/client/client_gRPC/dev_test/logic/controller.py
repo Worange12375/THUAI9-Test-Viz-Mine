@@ -9,6 +9,7 @@ from env import Environment
 from local_input import InputMethodManager
 from core.data_provider import DataProvider
 from core.decoder import GameDataDecoder
+from core.events import BasicEventLoop, EventBus, EventType
 
 
 class DummyEnvironment(Environment):
@@ -120,6 +121,11 @@ class Controller:
         self.game_mode: str = mode
         self.current_round: int = 0
         self.game_data: Optional[Dict[str, Any]] = None
+        self.data_provider: DataProvider = DataProvider()
+        self.runtime_source: str = "unknown"
+        self.runtime_board_file: Optional[str] = None
+        self.event_bus = EventBus()
+        self.event_loop = BasicEventLoop(self.event_bus)
 
     def create_environment(self, local_mode: bool = True, if_log: int = 1) -> DummyEnvironment:
         self.environment = DummyEnvironment(local_mode=local_mode, if_log=if_log)
@@ -159,38 +165,90 @@ class Controller:
         self.environment = DummyEnvironment(local_mode=local_mode, if_log=if_log)
         self.input_manager = self.environment.input_manager
 
+    def set_function_input_methods(self, init_handler, action_handler) -> None:
+        """为双方玩家统一设置函数式输入，便于 UI 或调试脚本接管输入。"""
+        if self.environment is None:
+            self.create_environment()
+        if self.input_manager is None:
+            raise RuntimeError("input_manager 未初始化")
+        self.input_manager.set_function_input_method(1, init_handler, action_handler)
+        self.input_manager.set_function_input_method(2, init_handler, action_handler)
+
     def get_environment_snapshot(self) -> Optional[Dict[str, Any]]:
         if self.environment is None:
             return None
         return self.environment.get_environment_snapshot()
 
-    def load_game_data(self, prefer_backend: bool = True):
-        provider = DataProvider()
-        raw_data = provider.get_game_data(prefer_backend=prefer_backend)
+    def list_mock_datasets(self) -> List[str]:
+        return self.data_provider.list_mock_datasets()
 
-        if isinstance(raw_data, dict) and "map" not in raw_data:
-            self.game_data = GameDataDecoder.decode(raw_data)
-        else:
+    def load_game_data(
+        self,
+        prefer_runtime: bool = True,
+        board_file: Optional[str] = None,
+        mock_dataset: Optional[str] = None,
+    ):
+        raw_data = self.data_provider.get_game_data(
+            prefer_runtime=prefer_runtime,
+            board_file=board_file,
+            mock_dataset=mock_dataset,
+        )
+        self.runtime_source = str(raw_data.get("source", "unknown")) if isinstance(raw_data, dict) else "unknown"
+
+        if self.runtime_source == "runtime_env":
+            self.runtime_board_file = raw_data.get("board_file")
+            self.create_environment(
+                local_mode=bool(raw_data.get("local_mode", True)),
+                if_log=int(raw_data.get("if_log", 1)),
+            )
             self.game_data = raw_data
+        else:
+            if isinstance(raw_data, dict) and "map" not in raw_data:
+                self.game_data = GameDataDecoder.decode(raw_data)
+            else:
+                self.game_data = raw_data
 
         self.current_round = 0
+        self.event_bus.publish(
+            EventType.GAME_LOADED,
+            {"source": self.runtime_source, "mode": self.game_mode},
+        )
         return self.game_data
 
     def select_mode(self, mode: str):
         if mode not in ("manual", "half-auto", "auto"):
             raise ValueError("mode must be manual/half-auto/auto")
+        if mode in ("half-auto", "auto"):
+            raise NotImplementedError("当前仅支持 manual，half-auto/auto 待开发")
         self.game_mode = mode
 
     def run_round(self):
         if self.environment is not None:
             if self.environment.is_game_over:
+                self.event_bus.publish(EventType.GAME_OVER, {"source": "runtime_env"})
                 print("当前环境已结束，停止执行")
                 return False
 
             if self.environment.round_number == 0 and len(getattr(self.environment, 'action_queue', [])) == 0:
-                self.environment.initialize_environment()
+                self.environment.initialize_environment(board_file=self.runtime_board_file)
+
+            self.event_bus.publish(
+                EventType.ROUND_STARTED,
+                {
+                    "source": "runtime_env",
+                    "round_number": int(self.environment.round_number + 1),
+                },
+            )
 
             self.environment.step()
+            self.event_bus.publish(
+                EventType.ROUND_FINISHED,
+                {
+                    "source": "runtime_env",
+                    "round_number": int(self.environment.round_number),
+                    "is_game_over": bool(self.environment.is_game_over),
+                },
+            )
             return not self.environment.is_game_over
 
         if self.game_data is None:
@@ -202,36 +260,48 @@ class Controller:
             return False
 
         round_info = rounds[self.current_round]
+        self.event_bus.publish(
+            EventType.ROUND_STARTED,
+            {
+                "source": "mock",
+                "round_number": int(round_info.get("roundNumber", self.current_round)),
+            },
+        )
         print(f"执行第 {round_info['roundNumber']} 回合，动作数量: {len(round_info['actions'])}")
         self.current_round += 1
+        self.event_bus.publish(
+            EventType.ROUND_FINISHED,
+            {
+                "source": "mock",
+                "round_number": int(round_info.get("roundNumber", self.current_round)),
+                "is_game_over": bool(self.current_round >= len(rounds)),
+            },
+        )
         return True
 
     def run_loop(self, max_rounds: Optional[int] = None):
         if self.environment is not None:
-            print(f"开始执行环境模式: {self.game_mode}")
-            rounds_executed = 0
-            while self.run_round():
-                rounds_executed += 1
-                if max_rounds is not None and rounds_executed >= max_rounds:
-                    break
+            print(f"开始执行本地玩法环境模式: {self.game_mode}")
+            rounds_executed = self.event_loop.run_steps(self.run_round, max_steps=max_rounds)
             print(f"环境执行结束，回合数: {rounds_executed}")
             return
 
         print(f"开始执行模式: {self.game_mode}")
-        while self.run_round():
-            if max_rounds is not None and self.current_round >= max_rounds:
-                break
+        self.event_loop.run_steps(self.run_round, max_steps=max_rounds)
         print("回合数据回放结束")
 
 
 if __name__ == "__main__":
     ctrl = Controller(mode="manual")
-    print("尝试优先后端数据加载")
+    print("尝试优先本地玩法环境加载")
     try:
-        game_data = ctrl.load_game_data(prefer_backend=True)
-        print("加载游戏数据成功，回合数", len(game_data.get('rounds', [])))
+        game_data = ctrl.load_game_data(prefer_runtime=True)
+        if ctrl.runtime_source == "runtime_env":
+            print("本地玩法环境模式已就绪")
+        else:
+            print("加载游戏数据成功，回合数", len(game_data.get('rounds', [])))
     except Exception as e:
-        print("后端加载失败，降级到 mock 数据：", e)
-        game_data = ctrl.load_game_data(prefer_backend=False)
+        print("本地玩法环境加载失败，降级到 mock 数据：", e)
+        game_data = ctrl.load_game_data(prefer_runtime=False)
 
     ctrl.run_loop()

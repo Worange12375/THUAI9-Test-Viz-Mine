@@ -1,61 +1,79 @@
 import json
-import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 class DataProvider:
-    """数据提供器：优先从后端获取，失败则回退到 mock JSON 文件。"""
+    """数据提供器：优先加载本地玩法环境描述，必要时回退到 mock JSON 文件。"""
 
-    def __init__(self, data_dir: str = None, backend_host: str = "localhost", backend_port: int = 50051):
-        self.backend_host = backend_host
-        self.backend_port = backend_port
+    def __init__(self, data_dir: str = None):
         base = data_dir or Path(__file__).resolve().parents[1]
         self.data_dir = Path(base) / "data"
+        self.mock_sets_dir = self.data_dir / "mock_sets"
         self.mock_path = self.data_dir / "log.json"
+        self.default_board_file = str(Path(__file__).resolve().parents[2] / "BoardCase" / "case1.txt")
 
-    def load_from_backend(self) -> Dict[str, Any]:
-        """尝试从真实后端加载游戏数据，后端不可用时抛出异常。"""
-        try:
-            import grpc
-            from grpc_client import message_pb2, message_pb2_grpc
+    @property
+    def runtime_ready(self) -> bool:
+        return True
 
-            target = f"{self.backend_host}:{self.backend_port}"
-            with grpc.insecure_channel(target) as channel:
-                stub = message_pb2_grpc.GameServiceStub(channel)
-                # 这里使用 SendInit 接口进行探测。真实接口根据后端定义调整。
-                init_request = message_pb2._InitRequest(message="ping")
-                response = stub.SendInit(init_request)
+    def close(self) -> None:
+        # 本地运行模式无需显式关闭资源，保留接口供控制器统一调用。
+        return
 
-                # if response is valid,后端正常
-                return {
-                    "backend_alive": True,
-                    "init_response": {
-                        "id": response.id if hasattr(response, 'id') else -1,
-                        "message": getattr(response, 'message', '')
-                    }
-                }
-        except Exception as e:
-            raise ConnectionError(f"无法连接到后端 {self.backend_host}:{self.backend_port}，原因: {e}")
+    def load_runtime_environment(self, board_file: Optional[str] = None) -> Dict[str, Any]:
+        """返回本地玩法环境描述，用于在测试端直接创建并运行 Environment。"""
+        chosen_board = board_file or self.default_board_file
+        return {
+            "source": "runtime_env",
+            "engine": "client_python_env",
+            "board_file": chosen_board,
+            "local_mode": True,
+            "if_log": 1,
+        }
 
-    def load_from_mock(self) -> Dict[str, Any]:
+    def list_mock_datasets(self) -> list[str]:
+        """返回可选 mock 数据集文件名列表。"""
+        datasets = [self.mock_path.name]
+        if self.mock_sets_dir.exists():
+            for p in sorted(self.mock_sets_dir.glob("*.json")):
+                datasets.append(p.name)
+        return datasets
+
+    def _resolve_mock_path(self, dataset_name: Optional[str] = None) -> Path:
+        if not dataset_name or dataset_name == self.mock_path.name:
+            return self.mock_path
+
+        candidate = self.mock_sets_dir / dataset_name
+        if candidate.exists():
+            return candidate
+
+        raise FileNotFoundError(f"未找到 mock 数据集: {dataset_name}")
+
+    def load_from_mock(self, dataset_name: Optional[str] = None) -> Dict[str, Any]:
         """从本地 mock 数据文件加载游戏日志，供可视化开发使用。"""
-        if not self.mock_path.exists():
-            raise FileNotFoundError(f"Mock 数据文件未找到: {self.mock_path}")
+        target = self._resolve_mock_path(dataset_name=dataset_name)
+        if not target.exists():
+            raise FileNotFoundError(f"Mock 数据文件未找到: {target}")
 
-        with open(self.mock_path, 'r', encoding='utf-8') as f:
+        with open(target, 'r', encoding='utf-8') as f:
             text = f.read()
             if not text.strip():
                 raise ValueError("Mock 数据文件为空")
-            return json.loads(text)
+            payload = json.loads(text)
+            payload["dataset"] = target.name
+            return payload
 
-    def get_game_data(self, prefer_backend: bool = True) -> Dict[str, Any]:
-        """获取游戏数据：优先后端，再 mock。"""
-        if prefer_backend:
-            try:
-                return self.load_from_backend()
-            except Exception:
-                # 后端连不上，使用本地 mock
-                return self.load_from_mock()
-        else:
-            return self.load_from_mock()
+    def get_game_data(
+        self,
+        prefer_runtime: bool = True,
+        board_file: Optional[str] = None,
+        mock_dataset: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """获取游戏数据：优先本地玩法环境描述，否则回退 mock。"""
+        if prefer_runtime:
+            return self.load_runtime_environment(board_file=board_file)
+
+        mock = self.load_from_mock(dataset_name=mock_dataset)
+        mock["source"] = "mock"
+        return mock
