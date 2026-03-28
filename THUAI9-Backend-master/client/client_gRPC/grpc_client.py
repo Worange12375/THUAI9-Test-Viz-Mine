@@ -68,9 +68,9 @@ def parse_args():
     parser.add_argument('--port', type=int, default=50051,
                       help='服务器端口号 (默认: 50051)')
     parser.add_argument('--mode', type=str, 
-                      choices=['local', 'remote', 'function'],
+                      choices=['local', 'remote', 'function', 'test'],
                       default='remote',
-                      help='运行模式: local-本地控制台模式, remote-远程gRPC模式, function-函数式输入模式 (默认: remote)')
+                      help='运行模式: local-本地控制台模式, remote-远程gRPC模式, function-函数式输入模式, test-实时测试模式 (默认: remote)')
     parser.add_argument('--board', type=str, default=None,
                       help='棋盘文件路径 (仅本地模式使用)')
     parser.add_argument('--strategy', type=str,
@@ -84,6 +84,29 @@ def parse_args():
 def run():
     # 解析命令行参数
     args = parse_args()
+    
+    # 新增测试模式
+    if args.mode == 'test':
+        print("=" * 60)
+        print("          THUAI9 测试模式")
+        print("=" * 60)
+        print()
+        print("启动实时测试环境...")
+        print()
+        
+        # 导入并运行测试程序
+        try:
+            from dev_test.main import run_realtime_test
+            run_realtime_test()
+        except ImportError as e:
+            print(f"错误：无法导入测试模块 - {e}")
+            print("请确保 dev_test/main.py 文件存在")
+        except Exception as e:
+            print(f"运行测试时出错: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return  # 测试模式结束后直接返回，不执行后续代码
     
     # 创建环境实例
     env = Environment(local_mode=(args.mode == 'local'))
