@@ -203,6 +203,10 @@ class Controller:
             )
             self.game_data = raw_data
         else:
+            # 切换到 mock 数据时，必须清空 runtime 环境，避免 run_round 误走 environment 分支。
+            self.environment = None
+            self.input_manager = None
+            self.runtime_board_file = None
             if isinstance(raw_data, dict) and "map" not in raw_data:
                 self.game_data = GameDataDecoder.decode(raw_data)
             else:
@@ -269,15 +273,18 @@ class Controller:
         )
         print(f"执行第 {round_info['roundNumber']} 回合，动作数量: {len(round_info['actions'])}")
         self.current_round += 1
+        is_game_over = bool(self.current_round >= len(rounds))
         self.event_bus.publish(
             EventType.ROUND_FINISHED,
             {
                 "source": "mock",
                 "round_number": int(round_info.get("roundNumber", self.current_round)),
-                "is_game_over": bool(self.current_round >= len(rounds)),
+                "is_game_over": is_game_over,
             },
         )
-        return True
+        if is_game_over:
+            self.event_bus.publish(EventType.GAME_OVER, {"source": "mock"})
+        return not is_game_over
 
     def run_loop(self, max_rounds: Optional[int] = None):
         if self.environment is not None:
