@@ -43,6 +43,17 @@ class InfoPanel(ttk.LabelFrame):
 		self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
 		self.text.configure(yscrollcommand=self.scrollbar.set)
 
+		self._tag_default = "log_default"
+		self._tag_system = "log_system"
+		self._tag_player = "log_player"
+		self._tag_round = "log_round"
+		self._tag_important = "log_important"
+		self.text.tag_configure(self._tag_default, foreground="#111111")
+		self.text.tag_configure(self._tag_system, foreground="#6b7280")
+		self.text.tag_configure(self._tag_player, foreground="#111111")
+		self.text.tag_configure(self._tag_round, foreground="#f97316")
+		self.text.tag_configure(self._tag_important, foreground="#dc2626")
+
 		self.text.pack(side="left", fill="both", expand=True)
 		self.scrollbar.pack(side="right", fill="y")
 
@@ -53,15 +64,32 @@ class InfoPanel(ttk.LabelFrame):
 		"""覆盖式写入内容，用于刷新展示文本。"""
 		self.set_readonly(False)
 		self.text.delete("1.0", "end")
-		self.text.insert("1.0", content)
+		self._insert_colored(content)
 		self.set_readonly(True)
 
 	def append_content(self, content: str) -> None:
 		"""追加内容，用于持续输出日志或状态流。"""
 		self.set_readonly(False)
-		self.text.insert("end", content)
+		self._insert_colored(content)
 		self.text.see("end")
 		self.set_readonly(True)
+
+	def _insert_colored(self, content: str) -> None:
+		for line in content.splitlines(keepends=True):
+			tag = self._pick_tag(line)
+			self.text.insert("end", line, (tag,))
+
+	def _pick_tag(self, line: str) -> str:
+		line_lower = line.lower()
+		if any(keyword in line for keyword in ("对局结束", "已暂停")) :
+			return self._tag_important
+		if "[ui]" in line_lower or "[event]" in line_lower:
+			return self._tag_system
+		if "player" in line_lower:
+			return self._tag_player
+		if "回合" in line:
+			return self._tag_round
+		return self._tag_default
 
 	def set_readonly(self, readonly: bool = True) -> None:
 		"""切换文本框是否可编辑。"""
@@ -296,18 +324,95 @@ class PlayerSummaryCard(ttk.LabelFrame):
 		self._refresh_detail_text()
 
 
+class PieceSquareCard(tk.Frame):
+	"""左上信息区用的棋子信息卡片（长方形）。"""
+
+	def __init__(self, parent: tk.Misc, width: int = 150, height: int = 120, is_large: bool = False) -> None:
+		super().__init__(parent, width=width, height=height, bd=2, relief="ridge", background="#f3f4f6")
+		self.is_large = is_large
+		self.pack_propagate(False)
+
+		header_font = ("Microsoft YaHei UI", 10 if is_large else 9, "bold")
+		body_font = ("Microsoft YaHei UI", 9 if is_large else 8)
+
+		self.header_label = tk.Label(self, text="-", font=header_font, bg="#f3f4f6", fg="#111827", anchor="w")
+		self.hp_label = tk.Label(self, text="HP: -", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.resist_label = tk.Label(self, text="🛡 A:-  ✨ B:-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.spell_label = tk.Label(self, text="法术位: -/-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.action_label = tk.Label(self, text="行动位: -/-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.move_label = tk.Label(self, text="移动力: -", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+
+		self.header_label.pack(fill="x", padx=6, pady=(6, 2))
+		self.hp_label.pack(fill="x", padx=6, pady=1)
+		self.resist_label.pack(fill="x", padx=6, pady=1)
+		self.spell_label.pack(fill="x", padx=6, pady=1)
+		self.action_label.pack(fill="x", padx=6, pady=1)
+		self.move_label.pack(fill="x", padx=6, pady=(1, 6))
+
+		if not self.is_large:
+			self.action_label.configure(text="")
+			self.move_label.configure(text="")
+
+	def _apply_colors(self, bg: str, fg: str) -> None:
+		self.configure(background=bg)
+		self.header_label.configure(bg=bg, fg=fg)
+		self.hp_label.configure(bg=bg, fg=fg)
+		self.resist_label.configure(bg=bg, fg=fg)
+		self.spell_label.configure(bg=bg, fg=fg)
+		self.action_label.configure(bg=bg, fg=fg)
+		self.move_label.configure(bg=bg, fg=fg)
+
+	def set_piece_state(
+		self,
+		*,
+		team: int,
+		piece_no: int,
+		hp: str,
+		physical_resist: str,
+		magic_resist: str,
+		spell_slots: str,
+		action_points: str,
+		movement: str,
+		is_selected: bool,
+		header_text: str | None = None,
+		is_inactive: bool = False,
+	) -> None:
+		"""更新卡片显示信息与高亮状态。"""
+		self.header_label.configure(text=header_text if header_text is not None else f"player{team}-{piece_no}")
+		self.hp_label.configure(text=f"HP: {hp}")
+		self.resist_label.configure(text=f"🛡 A:{physical_resist}  ✨ B:{magic_resist}")
+		self.spell_label.configure(text=f"法术位: {spell_slots}")
+		if self.is_large:
+			self.action_label.configure(text=f"行动位: {action_points}")
+			self.move_label.configure(text=f"移动力: {movement}")
+
+		if is_inactive:
+			self._apply_colors("#e5e7eb", "#6b7280")
+			return
+
+		if team == 1:
+			base_bg = "#fee2e2"
+			base_fg = "#7f1d1d"
+			focus_bg = "#fecaca"
+		else:
+			base_bg = "#dbeafe"
+			base_fg = "#1e3a8a"
+			focus_bg = "#bfdbfe"
+
+		if is_selected:
+			self._apply_colors(focus_bg, base_fg)
+		else:
+			self._apply_colors(base_bg, base_fg)
+
+
 class RightTopCompositePanel(ttk.LabelFrame):
 	"""右侧上方复合区域。
 
-	结构要求：
-	1. 整体分左右两列
-	2. 左列为正方形占位区域（不绘制图形）
-	3. 右列分上下两部分
-	4. 右列下半再均分为左右两块
-
-	本组件额外提供：
-	- 左侧正方形区内的“初始化”按钮
-	- 默认空实现初始化函数，后续可接入真实初始化流程
+	上下分布设计：
+	1. 上部（固定高度）：显示 THU AI logo
+	2. 下部（可变高度）：可变区，用于在不同模式下动态放置不同的内容
+	   - 模型：模式切换时自动刷新此区域的子组件
+	   - 可在 variable_frame 中动态添加/移除控件
 	"""
 
 	def __init__(
@@ -319,66 +424,42 @@ class RightTopCompositePanel(ttk.LabelFrame):
 		super().__init__(parent, text=title, padding=8)
 		self.on_initialize = on_initialize
 
-		# 第一层：左右两列，左列占较小比例，右列占较大比例，具体比例为 5:8。
-		self.columnconfigure(0, weight=5)
-		self.columnconfigure(1, weight=8)
-		self.rowconfigure(0, weight=1)
+		# 上下两行布局
+		self.columnconfigure(0, weight=1)
+		self.rowconfigure(0, weight=0)  # 上部 logo 固定高度
+		self.rowconfigure(1, weight=1)  # 下部可变区吃满空间
 
-		# 左列：保持正方形“占位”，不绘制几何图案。
-		left_block = ttk.LabelFrame(self, text="左侧正方形区", padding=6)
-		left_block.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-		left_block.columnconfigure(0, weight=1)
-		left_block.rowconfigure(0, weight=1)
+		# 上部：logo 区（固定显示）
+		logo_frame = ttk.LabelFrame(self, text="logo 区", padding=6)
+		logo_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+		logo_frame.columnconfigure(0, weight=1)
+		ttk.Label(logo_frame, text="DSSAST\nTHUAI大赛", anchor="center", justify="center", font=("Arial", 14, "bold")).pack(fill="both", expand=True)
 
-		self.square_placeholder = ttk.Frame(left_block)
-		# 使用 place 在容器中居中放置正方形占位块，确保“形状”由布局控制。
-		self.square_placeholder.place(x=0, y=0, width=1, height=1)
-		left_block.bind("<Configure>", self._layout_square_placeholder)
+		# 下部：可变区（容纳动态内容）
+		self.variable_frame = ttk.LabelFrame(self, text="可变区", padding=6)
+		self.variable_frame.grid(row=1, column=0, sticky="nsew")
+		self.variable_frame.columnconfigure(0, weight=1)
+		self.variable_frame.rowconfigure(0, weight=1)
 
-		# 在正方形占位区中放置“初始化”按钮，按钮大小随占位区自适应填充。
-		# 通过 command 绑定初始化函数，当前为占位空实现，后续可直接补全逻辑。
-		self.init_button = ttk.Button(self.square_placeholder, text="初始化", command=self._initialize)
-		self.init_button.pack(fill="both", expand=True)
+		# 预留占位内容
+		self._placeholder_label = ttk.Label(
+			self.variable_frame,
+			text="（可变区占位，后续根据模式放置内容）",
+			anchor="center",
+			foreground="#999999"
+		)
+		self._placeholder_label.pack(fill="both", expand=True)
 
-		# 右列：先上下两块（默认等分，后续如需比例可直接改 rowconfigure 权重）。
-		right_col = ttk.Frame(self)
-		right_col.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-		right_col.columnconfigure(0, weight=1)
-		right_col.rowconfigure(0, weight=1)
-		right_col.rowconfigure(1, weight=1)
+	def clear_variable_area(self) -> None:
+		"""清空可变区所有子组件。"""
+		for widget in self.variable_frame.winfo_children():
+			widget.pack_forget()
+			widget.destroy()
 
-		right_top = ttk.LabelFrame(right_col, text="右上区", padding=6)
-		right_top.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
-		ttk.Label(right_top, text="THU AI", anchor="center").pack(fill="both", expand=True)
-
-		right_bottom = ttk.Frame(right_col)
-		right_bottom.grid(row=1, column=0, sticky="nsew")
-		right_bottom.columnconfigure(0, weight=1)
-		right_bottom.columnconfigure(1, weight=1)
-		right_bottom.rowconfigure(0, weight=1)
-
-		right_bottom_left = ttk.LabelFrame(right_bottom, text="右下左区", padding=6)
-		right_bottom_left.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-		ttk.Label(right_bottom_left, text="可放统计 A", anchor="center").pack(fill="both", expand=True)
-
-		right_bottom_right = ttk.LabelFrame(right_bottom, text="右下右区", padding=6)
-		right_bottom_right.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
-		ttk.Label(right_bottom_right, text="可放统计 B", anchor="center").pack(fill="both", expand=True)
-
-	def _layout_square_placeholder(self, event: tk.Event) -> None:
-		"""根据左列可用尺寸，居中布局正方形占位块。"""
-		width = event.width
-		height = event.height
-		if width <= 2 or height <= 2:
-			return
-
-		# 留出内边距，避免占位块过大贴边，同时保留按钮可读性。
-		max_square = min(width, height) - 12
-		size = max(max_square, 1)
-		x = (width - size) // 2
-		y = (height - size) // 2
-
-		self.square_placeholder.place(x=x, y=y, width=size, height=size)
+	def set_variable_content(self, widget: tk.Widget) -> None:
+		"""向可变区放置新的内容控件。"""
+		self.clear_variable_area()
+		widget.pack(fill="both", expand=True, parent=self.variable_frame)
 
 	def _initialize(self) -> None:
 		"""初始化按钮回调。
@@ -394,11 +475,13 @@ class RightTopCompositePanel(ttk.LabelFrame):
 		pass
 
 
+
 class ChessboardPanel(ttk.LabelFrame):
-	"""20x20 棋盘绘制组件。
+	"""棋盘绘制组件（默认20x20，可随地图自适应）。
 
 	设计目标：
-	- 固定逻辑网格为 20 列 x 20 行
+	- 无地图数据时使用默认网格边长
+	- 有地图数据时根据地图尺寸自适应网格边长
 	- 绘制区域始终保持“正方形”
 	- 当父容器尺寸变化时自动重绘，保证棋盘清晰且居中
 	"""
@@ -406,9 +489,10 @@ class ChessboardPanel(ttk.LabelFrame):
 	def __init__(self, parent: tk.Misc, title: str = "棋盘区域", grid_size: int = 20) -> None:
 		super().__init__(parent, text=title, padding=10)
 
-		# grid_size 表示棋盘边长格数，当前需求为 20。
+		# grid_size 表示默认棋盘边长格数。
 		# 注意：不能命名为 grid_size，该名字与 Tk 内置方法同名。
-		self.board_grid_size = grid_size
+		self.default_board_grid_size = max(1, int(grid_size))
+		self.board_grid_size = self.default_board_grid_size
 
 		# 使用 Canvas 承担图形绘制工作，背景设为浅色便于观察网格线。
 		self.canvas = tk.Canvas(self, background="#f9f9f9", highlightthickness=0)
@@ -421,19 +505,63 @@ class ChessboardPanel(ttk.LabelFrame):
 		self.cell_size = 0.0
 		self.map_rows: list[list[int]] = []
 		self.pieces: list[dict[str, Any]] = []
+		self.click_handler: Callable[[int | None, int | None], None] | None = None
 
 		# 监听尺寸变化：窗口拉伸时自动重绘，保持棋盘为正方形。
 		self.canvas.bind("<Configure>", self._on_canvas_resize)
+		self.canvas.bind("<Button-1>", self._on_canvas_click)
+
+	def set_click_handler(self, handler: Callable[[int | None, int | None], None] | None) -> None:
+		"""设置棋盘点击回调。合法格返回(x,y)，非棋盘区域返回(None,None)。"""
+		self.click_handler = handler
 
 	def set_board_state(self, map_rows: list[list[int]] | None, pieces: list[dict[str, Any]] | None) -> None:
 		"""设置地图与棋子状态并触发重绘。"""
 		self.map_rows = map_rows if isinstance(map_rows, list) else []
 		self.pieces = pieces if isinstance(pieces, list) else []
+
+		# 地图是 15x15 时，若仍按 20x20 绘制，会在 15 处出现明显分界观感。
+		# 这里按地图数据自适应边长，避免额外补出的 -1 区域形成“十字分界”。
+		detected_height = len(self.map_rows)
+		detected_width = 0
+		for row in self.map_rows:
+			if isinstance(row, list):
+				detected_width = max(detected_width, len(row))
+		detected_grid = max(detected_width, detected_height)
+		self.board_grid_size = detected_grid if detected_grid > 0 else self.default_board_grid_size
+
 		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())
 
 	def _on_canvas_resize(self, event: tk.Event) -> None:
 		"""Canvas 尺寸变化时触发重绘。"""
 		self._draw_board(event.width, event.height)
+
+	def _on_canvas_click(self, event: tk.Event) -> None:
+		if self.click_handler is None:
+			return
+		x, y = self._canvas_to_board_xy(int(event.x), int(event.y))
+		self.click_handler(x, y)
+
+	def get_board_xy_from_root(self, root_x: int, root_y: int) -> tuple[int | None, int | None]:
+		"""将屏幕绝对坐标转换为棋盘格坐标。"""
+		canvas_x = int(root_x - self.canvas.winfo_rootx())
+		canvas_y = int(root_y - self.canvas.winfo_rooty())
+		return self._canvas_to_board_xy(canvas_x, canvas_y)
+
+	def _canvas_to_board_xy(self, canvas_x: int, canvas_y: int) -> tuple[int | None, int | None]:
+		if self.cell_size <= 0 or self.board_pixel_size <= 0:
+			return None, None
+		x0 = self.board_origin_x
+		y0 = self.board_origin_y
+		x1 = x0 + self.board_pixel_size
+		y1 = y0 + self.board_pixel_size
+		if not (x0 <= canvas_x < x1 and y0 <= canvas_y < y1):
+			return None, None
+		col = int((canvas_x - x0) / self.cell_size)
+		row = int((canvas_y - y0) / self.cell_size)
+		if not (0 <= col < self.board_grid_size and 0 <= row < self.board_grid_size):
+			return None, None
+		return col, row
 
 	def _draw_board(self, canvas_width: int, canvas_height: int) -> None:
 		"""绘制 20x20 正方形棋盘。
@@ -449,14 +577,16 @@ class ChessboardPanel(ttk.LabelFrame):
 		if canvas_width <= 2 or canvas_height <= 2:
 			return
 
-		# 预留少量内边距，避免边框贴边导致视觉拥挤。
+		# 为行列号预留边距，避免上侧列号压在棋盘内部。
 		padding = 8
-		usable_width = max(canvas_width - 2 * padding, 1)
-		usable_height = max(canvas_height - 2 * padding, 1)
+		top_label_space = 14
+		left_label_space = 10
+		usable_width = max(canvas_width - 2 * padding - left_label_space, 1)
+		usable_height = max(canvas_height - 2 * padding - top_label_space, 1)
 
 		self.board_pixel_size = min(usable_width, usable_height)
-		self.board_origin_x = (canvas_width - self.board_pixel_size) // 2
-		self.board_origin_y = (canvas_height - self.board_pixel_size) // 2
+		self.board_origin_x = (canvas_width - self.board_pixel_size) // 2 + left_label_space // 2
+		self.board_origin_y = (canvas_height - self.board_pixel_size) // 2 + top_label_space // 2
 		self.cell_size = self.board_pixel_size / self.board_grid_size
 
 		x0 = self.board_origin_x
@@ -468,12 +598,31 @@ class ChessboardPanel(ttk.LabelFrame):
 		for row in range(self.board_grid_size):
 			for col in range(self.board_grid_size):
 				cell_value = self._get_map_value(col, row)
-				fill_color = "#B7E4C7" if cell_value == 1 else "#5B3A29"
+				# 地图高度语义：-1=不可行(灰), 0=浅绿, 1=黄棕, 2=深棕。
+				if cell_value == -1:
+					fill_color = "#6B7280"
+				elif cell_value == 0:
+					fill_color = "#B7E4C7"
+				elif cell_value == 1:
+					fill_color = "#B08968"
+				elif cell_value == 2:
+					fill_color = "#5B3A29"
+				else:
+					fill_color = "#6b7280"
 				cx0 = x0 + col * self.cell_size
 				cy0 = y0 + row * self.cell_size
 				cx1 = cx0 + self.cell_size
 				cy1 = cy0 + self.cell_size
 				self.canvas.create_rectangle(cx0, cy0, cx1, cy1, fill=fill_color, outline="")
+
+		# 绘制行列索引，便于地图坐标编辑。
+		font_size = max(7, int(self.cell_size * 0.24))
+		for col in range(self.board_grid_size):
+			cx = x0 + (col + 0.5) * self.cell_size
+			self.canvas.create_text(cx, max(4, y0 - 10), text=str(col), fill="#374151", font=("Microsoft YaHei UI", font_size))
+		for row in range(self.board_grid_size):
+			cy = y0 + (row + 0.5) * self.cell_size
+			self.canvas.create_text(max(8, x0 - 8), cy, text=str(row), fill="#374151", font=("Microsoft YaHei UI", font_size))
 
 		# 先画棋盘外框，线条稍粗，便于与内部网格区分。
 		self.canvas.create_rectangle(x0, y0, x1, y1, outline="#1f2937", width=2)
@@ -496,12 +645,12 @@ class ChessboardPanel(ttk.LabelFrame):
 	def _get_map_value(self, x: int, y: int) -> int:
 		"""获取地图格值。越界或缺失时按不可行处理。"""
 		if y < 0 or y >= len(self.map_rows):
-			return 0
+			return -1
 		row = self.map_rows[y]
 		if not isinstance(row, list) or x < 0 or x >= len(row):
-			return 0
+			return -1
 		value = row[x]
-		return value if isinstance(value, int) else 0
+		return value if isinstance(value, int) else -1
 
 	def _draw_pieces(self) -> None:
 		"""在对应格子绘制棋子与白字标注。"""

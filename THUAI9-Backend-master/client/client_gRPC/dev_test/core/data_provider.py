@@ -10,8 +10,9 @@ class DataProvider:
         base = data_dir or Path(__file__).resolve().parents[1]
         self.data_dir = Path(base) / "data"
         self.mock_sets_dir = self.data_dir / "mock_sets"
+        self.backend_sets_dir = self.data_dir / "backend_sets"
         self.mock_path = self.data_dir / "log.json"
-        self.default_board_file = str(Path(__file__).resolve().parents[2] / "BoardCase" / "case1.txt")
+        self.default_board_file = str(self.backend_sets_dir / "backend_case_mountain_a.txt")
 
     @property
     def runtime_ready(self) -> bool:

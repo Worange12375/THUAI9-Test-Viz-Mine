@@ -132,6 +132,14 @@ class Controller:
         self.input_manager = self.environment.input_manager
         return self.environment
 
+    def _resolve_board_file(self, board_file: Optional[str] = None) -> str:
+        """统一解析测试端使用的棋盘文件路径，避免回落到 env 内部默认值。"""
+        if board_file:
+            return str(board_file)
+        if self.runtime_board_file:
+            return str(self.runtime_board_file)
+        return str(self.data_provider.default_board_file)
+
     def setup_environment(
         self,
         config: Optional[Dict[str, Any]] = None,
@@ -142,7 +150,7 @@ class Controller:
         env = self.create_environment(local_mode=local_mode, if_log=if_log)
         if isinstance(config, dict):
             env.apply_environment_config(config)
-        env.initialize_environment(board_file=board_file)
+        env.initialize_environment(board_file=self._resolve_board_file(board_file))
         return env
 
     def apply_environment_config(self, config: Dict[str, Any]) -> None:
@@ -153,7 +161,7 @@ class Controller:
     def initialize_environment(self, board_file: Optional[str] = None) -> None:
         if self.environment is None:
             self.create_environment()
-        self.environment.initialize_environment(board_file=board_file)
+        self.environment.initialize_environment(board_file=self._resolve_board_file(board_file))
 
     def reset_environment(self) -> None:
         if self.environment is None:
@@ -196,7 +204,7 @@ class Controller:
         self.runtime_source = str(raw_data.get("source", "unknown")) if isinstance(raw_data, dict) else "unknown"
 
         if self.runtime_source == "runtime_env":
-            self.runtime_board_file = raw_data.get("board_file")
+            self.runtime_board_file = self._resolve_board_file(raw_data.get("board_file"))
             self.create_environment(
                 local_mode=bool(raw_data.get("local_mode", True)),
                 if_log=int(raw_data.get("if_log", 1)),
@@ -234,7 +242,7 @@ class Controller:
                 return False
 
             if self.environment.round_number == 0 and len(getattr(self.environment, 'action_queue', [])) == 0:
-                self.environment.initialize_environment(board_file=self.runtime_board_file)
+                self.environment.initialize_environment(board_file=self._resolve_board_file())
 
             self.event_bus.publish(
                 EventType.ROUND_STARTED,
