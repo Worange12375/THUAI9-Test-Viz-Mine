@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from collections.abc import Callable
 from typing import Any, Sequence
@@ -81,8 +82,12 @@ class InfoPanel(ttk.LabelFrame):
 
 	def _pick_tag(self, line: str) -> str:
 		line_lower = line.lower()
-		if any(keyword in line for keyword in ("对局结束", "已暂停")) :
+		if any(keyword in line for keyword in ("对局结束", "游戏结束", "已死亡", "死亡", "胜者", "已暂停")):
 			return self._tag_important
+		if "game_over" in line_lower:
+			return self._tag_important
+		if "[公式]" in line:
+			return self._tag_system
 		if "[ui]" in line_lower or "[event]" in line_lower:
 			return self._tag_system
 		if "player" in line_lower:
@@ -334,33 +339,27 @@ class PieceSquareCard(tk.Frame):
 
 		header_font = ("Microsoft YaHei UI", 10 if is_large else 9, "bold")
 		body_font = ("Microsoft YaHei UI", 9 if is_large else 8)
+		small_font = ("Microsoft YaHei UI", 8 if is_large else 7)
 
 		self.header_label = tk.Label(self, text="-", font=header_font, bg="#f3f4f6", fg="#111827", anchor="w")
-		self.hp_label = tk.Label(self, text="HP: -", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
-		self.resist_label = tk.Label(self, text="🛡 A:-  ✨ B:-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
-		self.spell_label = tk.Label(self, text="法术位: -/-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
-		self.action_label = tk.Label(self, text="行动位: -/-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
-		self.move_label = tk.Label(self, text="移动力: -", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.status_label = tk.Label(self, text="HP:-  (-,-)", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.combat_label = tk.Label(self, text="🛡 -/-  ✨ -/-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.talent_label = tk.Label(self, text="敏- 智- 力-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.resource_label = tk.Label(self, text="法-/- 行-/- 移-", font=small_font, bg="#f3f4f6", fg="#334155", anchor="w")
 
-		self.header_label.pack(fill="x", padx=6, pady=(6, 2))
-		self.hp_label.pack(fill="x", padx=6, pady=1)
-		self.resist_label.pack(fill="x", padx=6, pady=1)
-		self.spell_label.pack(fill="x", padx=6, pady=1)
-		self.action_label.pack(fill="x", padx=6, pady=1)
-		self.move_label.pack(fill="x", padx=6, pady=(1, 6))
-
-		if not self.is_large:
-			self.action_label.configure(text="")
-			self.move_label.configure(text="")
+		self.header_label.pack(fill="x", padx=6, pady=(4, 1))
+		self.status_label.pack(fill="x", padx=6, pady=0)
+		self.combat_label.pack(fill="x", padx=6, pady=0)
+		self.talent_label.pack(fill="x", padx=6, pady=0)
+		self.resource_label.pack(fill="x", padx=6, pady=(1, 6))
 
 	def _apply_colors(self, bg: str, fg: str) -> None:
 		self.configure(background=bg)
 		self.header_label.configure(bg=bg, fg=fg)
-		self.hp_label.configure(bg=bg, fg=fg)
-		self.resist_label.configure(bg=bg, fg=fg)
-		self.spell_label.configure(bg=bg, fg=fg)
-		self.action_label.configure(bg=bg, fg=fg)
-		self.move_label.configure(bg=bg, fg=fg)
+		self.status_label.configure(bg=bg, fg=fg)
+		self.combat_label.configure(bg=bg, fg=fg)
+		self.talent_label.configure(bg=bg, fg=fg)
+		self.resource_label.configure(bg=bg, fg=fg)
 
 	def set_piece_state(
 		self,
@@ -374,17 +373,21 @@ class PieceSquareCard(tk.Frame):
 		action_points: str,
 		movement: str,
 		is_selected: bool,
+		position_text: str = "(-,-)",
+		physical_damage: str = "-",
+		magic_damage: str = "-",
+		dexterity: str = "-",
+		intelligence: str = "-",
+		strength: str = "-",
 		header_text: str | None = None,
 		is_inactive: bool = False,
 	) -> None:
 		"""更新卡片显示信息与高亮状态。"""
 		self.header_label.configure(text=header_text if header_text is not None else f"player{team}-{piece_no}")
-		self.hp_label.configure(text=f"HP: {hp}")
-		self.resist_label.configure(text=f"🛡 A:{physical_resist}  ✨ B:{magic_resist}")
-		self.spell_label.configure(text=f"法术位: {spell_slots}")
-		if self.is_large:
-			self.action_label.configure(text=f"行动位: {action_points}")
-			self.move_label.configure(text=f"移动力: {movement}")
+		self.status_label.configure(text=f"HP:{hp}  {position_text}")
+		self.combat_label.configure(text=f"🛡 {physical_damage}/{physical_resist}  ✨ {magic_damage}/{magic_resist}")
+		self.talent_label.configure(text=f"敏{dexterity} 智{intelligence} 力{strength}")
+		self.resource_label.configure(text=f"法{spell_slots} 行{action_points} 移{movement}")
 
 		if is_inactive:
 			self._apply_colors("#e5e7eb", "#6b7280")
@@ -431,9 +434,11 @@ class RightTopCompositePanel(ttk.LabelFrame):
 
 		# 上部：logo 区（固定显示）
 		logo_frame = ttk.LabelFrame(self, text="logo 区", padding=6)
+		logo_frame.configure(height=72)
+		logo_frame.grid_propagate(False)
 		logo_frame.grid(row=0, column=0, sticky="ew", pady=(0, 4))
 		logo_frame.columnconfigure(0, weight=1)
-		ttk.Label(logo_frame, text="DSSAST\nTHUAI大赛", anchor="center", justify="center", font=("Arial", 14, "bold")).pack(fill="both", expand=True)
+		ttk.Label(logo_frame, text="DSSAST\nTHUAI大赛", anchor="center", justify="center", font=("Arial", 11, "bold")).pack(fill="both", expand=True)
 
 		# 下部：可变区（容纳动态内容）
 		self.variable_frame = ttk.LabelFrame(self, text="可变区", padding=6)
@@ -505,15 +510,87 @@ class ChessboardPanel(ttk.LabelFrame):
 		self.cell_size = 0.0
 		self.map_rows: list[list[int]] = []
 		self.pieces: list[dict[str, Any]] = []
+		self.move_target_highlight: tuple[int, int] | None = None
+		self.spell_aoe_cells: list[tuple[int, int]] = []
+		self.spell_aoe_color = "#f97316"
+		self.trap_markers: list[dict[str, Any]] = []
 		self.click_handler: Callable[[int | None, int | None], None] | None = None
+		self._trap_image_raw: tk.PhotoImage | None = None
+		self._trap_image_cache: dict[int, tk.PhotoImage] = {}
 
 		# 监听尺寸变化：窗口拉伸时自动重绘，保持棋盘为正方形。
 		self.canvas.bind("<Configure>", self._on_canvas_resize)
 		self.canvas.bind("<Button-1>", self._on_canvas_click)
 
+	def _load_trap_image_raw(self) -> tk.PhotoImage | None:
+		if self._trap_image_raw is not None:
+			return self._trap_image_raw
+		try:
+			asset_path = os.path.join(os.path.dirname(__file__), "assets", "trap_pixel.png")
+			if not os.path.exists(asset_path):
+				self._trap_image_raw = None
+				return None
+			self._trap_image_raw = tk.PhotoImage(file=asset_path)
+			return self._trap_image_raw
+		except Exception:
+			self._trap_image_raw = None
+			return None
+
+	def _get_scaled_trap_image(self, target_px: int) -> tk.PhotoImage | None:
+		target_px = int(target_px)
+		if target_px <= 0:
+			return None
+		cached = self._trap_image_cache.get(target_px)
+		if cached is not None:
+			return cached
+		raw = self._load_trap_image_raw()
+		if raw is None:
+			return None
+		try:
+			raw_w = int(raw.width())
+			raw_h = int(raw.height())
+			base = max(raw_w, raw_h)
+			if base <= 0:
+				return None
+			ratio = float(target_px) / float(base)
+			img = raw
+			if ratio >= 1.0:
+				zoom = max(1, int(round(ratio)))
+				img = raw.zoom(zoom, zoom)
+				if img.width() > int(target_px * 1.3):
+					sub = max(1, int(round(img.width() / target_px)))
+					img = img.subsample(sub, sub)
+			else:
+				sub = max(1, int(round(1.0 / ratio)))
+				img = raw.subsample(sub, sub)
+			if img is raw:
+				# 未发生缩放，仍然缓存一份，避免反复计算。
+				self._trap_image_cache[target_px] = raw
+				return raw
+			self._trap_image_cache[target_px] = img
+			return img
+		except Exception:
+			return None
+
 	def set_click_handler(self, handler: Callable[[int | None, int | None], None] | None) -> None:
 		"""设置棋盘点击回调。合法格返回(x,y)，非棋盘区域返回(None,None)。"""
 		self.click_handler = handler
+
+	def set_move_target_highlight(self, target: tuple[int, int] | None) -> None:
+		"""设置移动目标高亮格（黄色细框）。"""
+		self.move_target_highlight = target
+		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())
+
+	def set_spell_aoe_overlay(self, cells: list[tuple[int, int]] | None, color: str = "#f97316") -> None:
+		"""设置法术 AOE 滤镜叠层。"""
+		self.spell_aoe_cells = list(cells) if isinstance(cells, list) else []
+		self.spell_aoe_color = str(color or "#f97316")
+		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())
+
+	def set_trap_markers(self, markers: list[dict[str, Any]] | None) -> None:
+		"""设置陷阱标记列表，元素包含 x/y/remaining。"""
+		self.trap_markers = list(markers) if isinstance(markers, list) else []
+		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())
 
 	def set_board_state(self, map_rows: list[list[int]] | None, pieces: list[dict[str, Any]] | None) -> None:
 		"""设置地图与棋子状态并触发重绘。"""
@@ -594,7 +671,9 @@ class ChessboardPanel(ttk.LabelFrame):
 		x1 = x0 + self.board_pixel_size
 		y1 = y0 + self.board_pixel_size
 
-		# 先画 20x20 格子底色。
+		# 先画格子底色。边界对齐到整数像素，减少缩放时偶发细缝。
+		x_bounds = [int(round(x0 + i * self.cell_size)) for i in range(self.board_grid_size + 1)]
+		y_bounds = [int(round(y0 + i * self.cell_size)) for i in range(self.board_grid_size + 1)]
 		for row in range(self.board_grid_size):
 			for col in range(self.board_grid_size):
 				cell_value = self._get_map_value(col, row)
@@ -609,10 +688,10 @@ class ChessboardPanel(ttk.LabelFrame):
 					fill_color = "#5B3A29"
 				else:
 					fill_color = "#6b7280"
-				cx0 = x0 + col * self.cell_size
-				cy0 = y0 + row * self.cell_size
-				cx1 = cx0 + self.cell_size
-				cy1 = cy0 + self.cell_size
+				cx0 = x_bounds[col]
+				cy0 = y_bounds[row]
+				cx1 = x_bounds[col + 1]
+				cy1 = y_bounds[row + 1]
 				self.canvas.create_rectangle(cx0, cy0, cx1, cy1, fill=fill_color, outline="")
 
 		# 绘制行列索引，便于地图坐标编辑。
@@ -632,15 +711,54 @@ class ChessboardPanel(ttk.LabelFrame):
 		for i in range(1, self.board_grid_size):
 			line_offset = i * self.cell_size
 
-			# 竖线
-			vx = x0 + line_offset
+			# 线条对齐到半像素，减少缩放时偶发“粗横线/粗竖线”。
+			vx = int(round(x0 + line_offset)) + 0.5
 			self.canvas.create_line(vx, y0, vx, y1, fill="#9ca3af", width=1)
 
-			# 横线
-			hy = y0 + line_offset
+			hy = int(round(y0 + line_offset)) + 0.5
 			self.canvas.create_line(x0, hy, x1, hy, fill="#9ca3af", width=1)
 
+		# 法术 AOE 预览：用点状半透明滤镜覆盖范围格。
+		for cell in self.spell_aoe_cells:
+			if not isinstance(cell, tuple) or len(cell) != 2:
+				continue
+			tx, ty = int(cell[0]), int(cell[1])
+			if 0 <= tx < self.board_grid_size and 0 <= ty < self.board_grid_size:
+				tx0 = self.board_origin_x + tx * self.cell_size
+				ty0 = self.board_origin_y + ty * self.cell_size
+				tx1 = tx0 + self.cell_size
+				ty1 = ty0 + self.cell_size
+				self.canvas.create_rectangle(
+					tx0,
+					ty0,
+					tx1,
+					ty1,
+					fill=self.spell_aoe_color,
+					outline="",
+					stipple="gray25",
+				)
+
+		# 移动时目标格高亮：黄色细框。
+		target = self.move_target_highlight
+		if target is not None:
+			tx, ty = target
+			if 0 <= tx < self.board_grid_size and 0 <= ty < self.board_grid_size:
+				tx0 = self.board_origin_x + tx * self.cell_size
+				ty0 = self.board_origin_y + ty * self.cell_size
+				tx1 = tx0 + self.cell_size
+				ty1 = ty0 + self.cell_size
+				pad = max(1.0, self.cell_size * 0.08)
+				self.canvas.create_rectangle(
+					tx0 + pad,
+					ty0 + pad,
+					tx1 - pad,
+					ty1 - pad,
+					outline="#facc15",
+					width=1,
+				)
+
 		self._draw_pieces()
+		self._draw_trap_markers()
 
 	def _get_map_value(self, x: int, y: int) -> int:
 		"""获取地图格值。越界或缺失时按不可行处理。"""
@@ -662,6 +780,7 @@ class ChessboardPanel(ttk.LabelFrame):
 			y = piece.get("y")
 			team = piece.get("team")
 			label = piece.get("label")
+			is_current = bool(piece.get("is_current", False))
 			if not isinstance(x, int) or not isinstance(y, int):
 				continue
 			if x < 0 or y < 0 or x >= self.board_grid_size or y >= self.board_grid_size:
@@ -671,7 +790,10 @@ class ChessboardPanel(ttk.LabelFrame):
 			cy0 = self.board_origin_y + y * self.cell_size
 			cx1 = cx0 + self.cell_size
 			cy1 = cy0 + self.cell_size
-			piece_color = "#D62828" if team == 1 else "#1D4ED8"
+			if team == 1:
+				piece_color = "#9F1239" if is_current else "#D62828"
+			else:
+				piece_color = "#1E3A8A" if is_current else "#1D4ED8"
 
 			pad = self.cell_size * 0.12
 			self.canvas.create_rectangle(
@@ -695,6 +817,65 @@ class ChessboardPanel(ttk.LabelFrame):
 					justify="center",
 				)
 
+	def _draw_trap_markers(self) -> None:
+		if self.cell_size <= 0:
+			return
+		for marker in self.trap_markers:
+			x = marker.get("x")
+			y = marker.get("y")
+			remaining = int(marker.get("remaining", 0))
+			if not isinstance(x, int) or not isinstance(y, int) or remaining <= 0:
+				continue
+			if x < 0 or y < 0 or x >= self.board_grid_size or y >= self.board_grid_size:
+				continue
+
+			cx0 = self.board_origin_x + x * self.cell_size
+			cy0 = self.board_origin_y + y * self.cell_size
+			cx1 = cx0 + self.cell_size
+			cy1 = cy0 + self.cell_size
+
+			trap_img = self._get_scaled_trap_image(int(self.cell_size * 0.65))
+			if trap_img is not None:
+				self.canvas.create_image((cx0 + cx1) / 2, (cy0 + cy1) / 2, image=trap_img, anchor="center")
+				font_size = max(7, int(self.cell_size * 0.2))
+				pad = max(1.0, self.cell_size * 0.1)
+				x_text = cx0 + pad
+				y_text = cy0 + pad
+				# 轻量描边：先画一层黑字做阴影，再画白字。
+				self.canvas.create_text(
+					x_text + 1,
+					y_text + 1,
+					text=str(remaining),
+					fill="#111827",
+					font=("Microsoft YaHei UI", font_size, "bold"),
+					anchor="nw",
+				)
+				self.canvas.create_text(
+					x_text,
+					y_text,
+					text=str(remaining),
+					fill="#FFFFFF",
+					font=("Microsoft YaHei UI", font_size, "bold"),
+					anchor="nw",
+				)
+				continue
+
+			size = max(6.0, self.cell_size * 0.28)
+			pad = max(1.0, self.cell_size * 0.08)
+			sx0 = cx0 + pad
+			sy0 = cy0 + pad
+			sx1 = sx0 + size
+			sy1 = sy0 + size
+			self.canvas.create_rectangle(sx0, sy0, sx1, sy1, fill="#111827", outline="#f59e0b", width=1)
+			font_size = max(7, int(self.cell_size * 0.2))
+			self.canvas.create_text(
+				(sx0 + sx1) / 2,
+				(sy0 + sy1) / 2,
+				text=str(remaining),
+				fill="#FFFFFF",
+				font=("Microsoft YaHei UI", font_size, "bold"),
+			)
+
 	def reset_board_state(self) -> None:
 		"""重置棋盘到初始状态。
 
@@ -703,4 +884,8 @@ class ChessboardPanel(ttk.LabelFrame):
 		"""
 		self.map_rows = []
 		self.pieces = []
+		self.trap_markers = []
+		self.spell_aoe_cells = []
+		self.move_target_highlight = None
+		self.board_grid_size = self.default_board_grid_size
 		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())

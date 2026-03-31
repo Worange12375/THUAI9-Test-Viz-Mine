@@ -19,7 +19,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from env import ActionSet, PieceArg, Point
+from env import ActionSet, Area, AttackContext, PieceArg, Point, SpellContext, SpellFactory
 from logic.controller import Controller
 from core.events import EventType
 
@@ -77,14 +77,15 @@ class MainUI:
 		main_container = ttk.Frame(self.root, padding=12)
 		main_container.pack(fill="both", expand=True)
 
-		# 左右两列保持原有布局结构，仅做比例微调（由 5:3 调整为 5:4）。
-		# 目的：给右侧新增复合区更多宽度，避免其内部内容拥挤。
-		main_container.columnconfigure(0, weight=7)
-		main_container.columnconfigure(1, weight=5)
+		# 将左右列改为更接近 1:1，整体收窄左侧信息区与棋盘区宽度。
+		main_container.columnconfigure(0, weight=6)
+		main_container.columnconfigure(1, weight=6)
 		main_container.rowconfigure(0, weight=1)
 
 		left_frame = ttk.Frame(main_container)
 		right_frame = ttk.Frame(main_container)
+		left_frame.configure(width=620)
+		left_frame.grid_propagate(False)
 
 		left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 		right_frame.grid(row=0, column=1, sticky="nsew")
@@ -129,6 +130,7 @@ class MainUI:
 		self.attribute_settings_force_init_mode = False
 		self.runtime_init_config_ready = False
 		self.runtime_piece_init_config: dict[str, dict[str, Any]] = {}
+		self.runtime_piece_slot_binding: dict[int, str] = {}
 		self.mock_map_height_overrides: dict[tuple[int, int], int] = {}
 		self.runtime_card_slots: list[dict[str, Any]] = []
 		self.mock_card_slots: list[dict[str, Any]] = []
@@ -138,16 +140,38 @@ class MainUI:
 		self.action_move_piece_var = tk.StringVar(value="当前棋子")
 		self.action_move_x_var = tk.StringVar(value="")
 		self.action_move_y_var = tk.StringVar(value="")
+		self.action_move_x_var.trace_add("write", lambda *_args: self._refresh_board_view())
+		self.action_move_y_var.trace_add("write", lambda *_args: self._refresh_board_view())
 		self.action_attack_target_var = tk.StringVar(value="")
 		self.action_attack_type_var = tk.StringVar(value="")
+		self.action_custom_damage_var = tk.StringVar(value="10")
+		self.action_custom_preview_var = tk.StringVar(value="")
 		self.action_spell_target_var = tk.StringVar(value="")
 		self.action_spell_type_var = tk.StringVar(value="")
+		self.action_spell_point_x_var = tk.StringVar(value="")
+		self.action_spell_point_y_var = tk.StringVar(value="")
+		self.action_spell_option_map: dict[str, Any] = {}
+		self.action_spell_target_option_map: dict[str, Any] = {}
 		self.action_detail_container: ttk.Frame | None = None
+		self.action_mode_body_container: ttk.Frame | None = None
 		self.action_confirm_button: ttk.Button | None = None
 		self.action_feedback_label: ttk.Label | None = None
+		self.action_feedback_clear_job: Optional[str] = None
+		self._rendering_action_mode_body = False
+		self.action_attack_target_var.trace_add("write", lambda *_args: self._refresh_custom_attack_preview())
+		self.action_custom_damage_var.trace_add("write", lambda *_args: self._refresh_custom_attack_preview())
+		self.action_spell_type_var.trace_add("write", lambda *_args: self._rerender_spell_mode_if_needed())
+		self.action_spell_target_var.trace_add("write", lambda *_args: self._refresh_board_view())
+		self.action_spell_point_x_var.trace_add("write", lambda *_args: self._refresh_board_view())
+		self.action_spell_point_y_var.trace_add("write", lambda *_args: self._refresh_board_view())
+		self.game_over_dialog_shown = False
 		self.runtime_cycle_done_piece_ids: set[int] = set()
 		self.runtime_completed_turns = 0
 		self.runtime_last_round_info_line = ""
+		self.action_move_pick_waiting = False
+		self.action_move_pick_overlay: tk.Toplevel | None = None
+		self.action_pick_mode = ""
+		self.runtime_trap_effects: list[dict[str, Any]] = []
 
 		self.controller.event_bus.subscribe(EventType.GAME_LOADED, self._on_event_game_loaded)
 		self.controller.event_bus.subscribe(EventType.ROUND_STARTED, self._on_event_round_started)
@@ -282,6 +306,17 @@ class MainUI:
 		"""按当前 selected_source / selected_mock_dataset 直接加载，不弹模式选择框。"""
 		if self.running:
 			self._on_click_pause()
+		# 进入新对局：清空行动面板的选点/预览状态，避免重开后目标框或火球 AOE 残留。
+		self._stop_action_move_point_pick()
+		self.action_ui_mode.set("move")
+		self.action_move_x_var.set("")
+		self.action_move_y_var.set("")
+		self.action_spell_type_var.set("")
+		self.action_spell_target_var.set("")
+		self.action_spell_point_x_var.set("")
+		self.action_spell_point_y_var.set("")
+		self.action_spell_option_map = {}
+		self.action_spell_target_option_map = {}
 		self.runtime_card_slots = []
 		self.mock_card_slots = []
 		self.runtime_initiative_snapshot = []
@@ -289,6 +324,7 @@ class MainUI:
 		self.runtime_cycle_done_piece_ids = set()
 		self.runtime_completed_turns = 0
 		self.runtime_last_round_info_line = ""
+		self.game_over_dialog_shown = False
 		try:
 			self.controller.select_mode("manual")
 			if self.selected_source == "runtime":
@@ -302,6 +338,7 @@ class MainUI:
 				self._refresh_board_view()
 				self.runtime_init_config_ready = False
 				self.runtime_piece_init_config = {}
+				self.runtime_piece_slot_binding = {}
 				self._prepare_runtime_piece_init_defaults()
 				self._on_click_attribute_settings(force_runtime_init=True)
 				if not self.runtime_init_config_ready:
@@ -331,6 +368,7 @@ class MainUI:
 			self.controller.load_game_data(prefer_runtime=False, mock_dataset=self.selected_mock_dataset)
 			self.runtime_card_slots = []
 			self.mock_card_slots = []
+			self.runtime_piece_slot_binding = {}
 			self.loaded = True
 			self.left_board_panel.reset_board_state()
 			self._initialize_mock_positions()
@@ -373,14 +411,14 @@ class MainUI:
 					"strength": "10",
 					"dexterity": "10",
 					"intelligence": "10",
-					"physical_resist": "0",
-					"magic_resist": "0",
-					"physical_damage": "0",
-					"magic_damage": "0",
-					"action_points": "1",
-					"max_action_points": "1",
-					"spell_slots": "1",
-					"max_spell_slots": "1",
+					"physical_resist": "6",
+					"magic_resist": "6",
+					"physical_damage": "6",
+					"magic_damage": "6",
+					"action_points": "2",
+					"max_action_points": "2",
+					"spell_slots": "2",
+					"max_spell_slots": "2",
 					"movement": "10",
 					"pos_x": str(x),
 					"pos_y": str(y),
@@ -470,18 +508,18 @@ class MainUI:
 			piece.strength = self._safe_int(str(cfg.get("strength", 10)), int(getattr(piece, "strength", 10)))
 			piece.dexterity = self._safe_int(str(cfg.get("dexterity", 10)), int(getattr(piece, "dexterity", 10)))
 			piece.intelligence = self._safe_int(str(cfg.get("intelligence", 10)), int(getattr(piece, "intelligence", 10)))
-			piece.physical_resist = self._safe_int(str(cfg.get("physical_resist", 0)), int(getattr(piece, "physical_resist", 0)))
-			piece.magic_resist = self._safe_int(str(cfg.get("magic_resist", 0)), int(getattr(piece, "magic_resist", 0)))
-			piece.physical_damage = self._safe_int(str(cfg.get("physical_damage", 0)), int(getattr(piece, "physical_damage", 0)))
-			piece.magic_damage = self._safe_int(str(cfg.get("magic_damage", 0)), int(getattr(piece, "magic_damage", 0)))
-			piece.max_action_points = self._safe_int(str(cfg.get("max_action_points", 1)), int(getattr(piece, "max_action_points", 1)))
+			piece.physical_resist = self._safe_int(str(cfg.get("physical_resist", 6)), int(getattr(piece, "physical_resist", 6)))
+			piece.magic_resist = self._safe_int(str(cfg.get("magic_resist", 6)), int(getattr(piece, "magic_resist", 6)))
+			piece.physical_damage = self._safe_int(str(cfg.get("physical_damage", 6)), int(getattr(piece, "physical_damage", 6)))
+			piece.magic_damage = self._safe_int(str(cfg.get("magic_damage", 6)), int(getattr(piece, "magic_damage", 6)))
+			piece.max_action_points = self._safe_int(str(cfg.get("max_action_points", 2)), int(getattr(piece, "max_action_points", 2)))
 			piece.action_points = min(
-				self._safe_int(str(cfg.get("action_points", 1)), int(getattr(piece, "action_points", 1))),
+				self._safe_int(str(cfg.get("action_points", 2)), int(getattr(piece, "action_points", 2))),
 				int(piece.max_action_points),
 			)
-			piece.max_spell_slots = self._safe_int(str(cfg.get("max_spell_slots", 1)), int(getattr(piece, "max_spell_slots", 1)))
+			piece.max_spell_slots = self._safe_int(str(cfg.get("max_spell_slots", 2)), int(getattr(piece, "max_spell_slots", 2)))
 			piece.spell_slots = min(
-				self._safe_int(str(cfg.get("spell_slots", 1)), int(getattr(piece, "spell_slots", 1))),
+				self._safe_int(str(cfg.get("spell_slots", 2)), int(getattr(piece, "spell_slots", 2))),
 				int(piece.max_spell_slots),
 			)
 			piece.movement = self._safe_float(str(cfg.get("movement", 10)), float(getattr(piece, "movement", 10.0)))
@@ -559,6 +597,20 @@ class MainUI:
 		"""优先取 env.current_piece，缺失时回退 action_queue 队首。"""
 		current_piece = getattr(env, "current_piece", None)
 		if current_piece is not None and bool(getattr(current_piece, "is_alive", True)):
+			if self.runtime_card_slots:
+				slot_pieces = [s.get("piece") for s in self.runtime_card_slots]
+				if current_piece not in slot_pieces:
+					match_piece = next(
+						(
+							p
+							for p in slot_pieces
+							if int(getattr(p, "id", -1)) == int(getattr(current_piece, "id", -2))
+						),
+						None,
+					)
+					if match_piece is not None:
+						setattr(env, "current_piece", match_piece)
+						return match_piece
 			return current_piece
 		action_queue = [p for p in self._coerce_piece_list(getattr(env, "action_queue", [])) if bool(getattr(p, "is_alive", True))]
 		if action_queue:
@@ -655,7 +707,7 @@ class MainUI:
 		self.controller.set_function_input_methods(self._auto_init_handler, self._ui_action_handler)
 
 	def _initialize_runtime_environment_with_initiative_capture(self, env: Any, board_file: Optional[str]) -> None:
-		"""不修改 env 文件，在 UI 侧捕获初始化阶段的先攻掷骰明细。"""
+		"""捕获初始化阶段的先攻掷骰明细。"""
 		self.runtime_initiative_snapshot = []
 		if env is None:
 			return
@@ -685,11 +737,11 @@ class MainUI:
 		for piece in self._coerce_piece_list(getattr(getattr(env, "player1", None), "pieces", [])):
 			roll_value = int(captured_rolls[roll_idx]) if roll_idx < len(captured_rolls) else 0
 			roll_idx += 1
-			attr_value = int(getattr(piece, "intelligence", 0))
+			attr_value = int(getattr(piece, "dexterity", 0))
 			snapshot.append(
 				{
 					"piece": piece,
-					"attr_name": "智力",
+					"attr_name": "敏捷",
 					"attr_value": attr_value,
 					"roll": roll_value,
 					"bonus": attr_value,
@@ -739,7 +791,8 @@ class MainUI:
 		if env is None:
 			return data
 
-		selected_id = int(getattr(getattr(env, "current_piece", None), "id", -1))
+		selected_piece = self._get_runtime_current_piece(env)
+		selected_id = int(getattr(selected_piece, "id", -1))
 		for team_id, player_attr in ((1, "player1"), (2, "player2")):
 			player = getattr(env, player_attr, None)
 			pieces = self._coerce_piece_list(getattr(player, "pieces", None) if player is not None else None)
@@ -874,13 +927,13 @@ class MainUI:
 
 		piece_identity_to_slot: dict[int, tuple[int, int, str]] = {}
 		slot_code_to_piece: dict[str, Any] = {}
-		for team_id, player_attr in ((1, "player1"), (2, "player2")):
-			player = getattr(env, player_attr, None)
-			pieces = self._coerce_piece_list(getattr(player, "pieces", None) if player is not None else None)
-			for idx, piece in enumerate(pieces[:3], start=1):
-				code = self._slot_code(team_id, idx)
-				piece_identity_to_slot[id(piece)] = (team_id, idx, code)
-				slot_code_to_piece[code] = piece
+		runtime_map = self._runtime_piece_slot_map()
+		for slot_key, piece in runtime_map.items():
+			team_id = int(slot_key[1])
+			idx = int(slot_key[-1])
+			code = self._slot_code(team_id, idx)
+			piece_identity_to_slot[id(piece)] = (team_id, idx, code)
+			slot_code_to_piece[code] = piece
 
 		action_queue = self._coerce_piece_list(getattr(env, "action_queue", []))
 		seen_codes: set[str] = set()
@@ -979,7 +1032,7 @@ class MainUI:
 			if not self.runtime_card_slots:
 				self._initialize_runtime_card_slots()
 
-			current_piece = getattr(self.controller.environment, "current_piece", None)
+			current_piece = self._get_runtime_current_piece(self.controller.environment)
 			for idx, card in enumerate(self.piece_cards):
 				slot = self.runtime_card_slots[idx] if idx < len(self.runtime_card_slots) else None
 				if slot is None:
@@ -994,6 +1047,12 @@ class MainUI:
 						movement="-",
 						is_selected=False,
 						header_text="--",
+						position_text="(-,-)",
+						physical_damage="-",
+						magic_damage="-",
+						dexterity="-",
+						intelligence="-",
+						strength="-",
 						is_inactive=True,
 					)
 					continue
@@ -1015,27 +1074,44 @@ class MainUI:
 						movement="-",
 						is_selected=False,
 						header_text=header_text,
+						position_text="(-,-)",
+						physical_damage="-",
+						magic_damage="-",
+						dexterity="-",
+						intelligence="-",
+						strength="-",
 						is_inactive=True,
 					)
 					continue
 
 				alive = bool(getattr(piece, "is_alive", True))
+				hp_cur = int(getattr(piece, "health", 0)) if alive else 0
+				hp_max = int(getattr(piece, "max_health", hp_cur))
 				spell_cur = int(getattr(piece, "spell_slots", 0))
 				spell_max = int(getattr(piece, "max_spell_slots", 0))
 				action_cur = int(getattr(piece, "action_points", 0))
 				action_max = int(getattr(piece, "max_action_points", 0))
 				move_value = float(getattr(piece, "movement", 0.0))
-				is_selected = (piece is current_piece) and alive
+				pos = getattr(piece, "position", None)
+				pos_text = f"({int(getattr(pos, 'x', -1))},{int(getattr(pos, 'y', -1))})" if pos is not None else "(-,-)"
+				current_id = int(getattr(current_piece, "id", -1)) if current_piece is not None else -1
+				is_selected = int(getattr(piece, "id", -1)) == current_id and alive
 
 				card.set_piece_state(
 					team=team,
 					piece_no=piece_no,
-					hp=str(int(getattr(piece, "health", 0))) if alive else "0",
+					hp=f"{hp_cur}/{hp_max}",
+					position_text=pos_text,
+					physical_damage=str(int(getattr(piece, "physical_damage", 0))),
 					physical_resist=str(int(getattr(piece, "physical_resist", 0))),
+					magic_damage=str(int(getattr(piece, "magic_damage", 0))),
 					magic_resist=str(int(getattr(piece, "magic_resist", 0))),
 					spell_slots=f"{spell_cur}/{spell_max}",
 					action_points=f"{action_cur}/{action_max}",
 					movement=f"{move_value:.1f}",
+					dexterity=str(int(getattr(piece, "dexterity", 0))),
+					intelligence=str(int(getattr(piece, "intelligence", 0))),
+					strength=str(int(getattr(piece, "strength", 0))),
 					is_selected=is_selected,
 					header_text=header_text,
 					is_inactive=not alive,
@@ -1061,6 +1137,12 @@ class MainUI:
 					movement="-",
 					is_selected=False,
 					header_text="--",
+					position_text="(-,-)",
+					physical_damage="-",
+					magic_damage="-",
+					dexterity="-",
+					intelligence="-",
+					strength="-",
 					is_inactive=True,
 				)
 				continue
@@ -1082,12 +1164,27 @@ class MainUI:
 					movement="-",
 					is_selected=False,
 					header_text=header_text,
+					position_text="(-,-)",
+					physical_damage="-",
+					magic_damage="-",
+					dexterity="-",
+					intelligence="-",
+					strength="-",
 					is_inactive=True,
 				)
 				continue
 
 			stats = self.mock_piece_stats_by_id.get(int(soldier_id), {})
 			hp_value = int(self.mock_last_health_by_id.get(int(soldier_id), int(stats.get("health", 0) if isinstance(stats, dict) else 0)))
+			hp_max = hp_value
+			if isinstance(stats, dict):
+				for key in ("max_health", "maxHealth", "health"):
+					if key in stats:
+						try:
+							hp_max = int(stats.get(key, hp_value))
+						except Exception:
+							hp_max = hp_value
+						break
 			alive = hp_value > 0
 			spell_cur = stats.get("spell_slots", "-") if isinstance(stats, dict) else "-"
 			spell_max = stats.get("max_spell_slots", "-") if isinstance(stats, dict) else "-"
@@ -1099,12 +1196,18 @@ class MainUI:
 			card.set_piece_state(
 				team=team,
 				piece_no=piece_no,
-				hp=str(hp_value),
+				hp=f"{int(hp_value)}/{int(hp_max)}",
+				position_text=f"({int(self.mock_last_positions_by_id.get(int(soldier_id), (-1, -1))[0])},{int(self.mock_last_positions_by_id.get(int(soldier_id), (-1, -1))[1])})",
+				physical_damage=str(stats.get("physical_damage", "-") if isinstance(stats, dict) else "-"),
 				physical_resist=str(stats.get("physical_resist", "-") if isinstance(stats, dict) else "-"),
+				magic_damage=str(stats.get("magic_damage", "-") if isinstance(stats, dict) else "-"),
 				magic_resist=str(stats.get("magic_resist", "-") if isinstance(stats, dict) else "-"),
 				spell_slots=f"{spell_cur}/{spell_max}" if spell_cur != "-" and spell_max != "-" else "-/-",
 				action_points=f"{action_cur}/{action_max}" if action_cur != "-" and action_max != "-" else "-/-",
 				movement=str(move_val),
+				dexterity=str(stats.get("dexterity", "-") if isinstance(stats, dict) else "-"),
+				intelligence=str(stats.get("intelligence", "-") if isinstance(stats, dict) else "-"),
+				strength=str(stats.get("strength", "-") if isinstance(stats, dict) else "-"),
 				is_selected=is_selected,
 				header_text=header_text,
 				is_inactive=not alive,
@@ -1171,6 +1274,8 @@ class MainUI:
 		env = self.controller.environment
 		if env is None:
 			return []
+		current_piece = self._get_runtime_current_piece(env)
+		current_id = int(getattr(current_piece, "id", -1)) if current_piece is not None else -1
 
 		team_pieces: dict[int, list[Any]] = {1: [], 2: []}
 		for team_id, player_attr in ((1, "player1"), (2, "player2")):
@@ -1186,7 +1291,7 @@ class MainUI:
 		render_pieces: list[dict[str, Any]] = []
 		for team_id in (1, 2):
 			sorted_pieces = sorted(team_pieces[team_id], key=lambda p: int(getattr(p, "id", 0)))
-			for idx, piece in enumerate(sorted_pieces, start=1):
+			for piece in sorted_pieces:
 				pos = getattr(piece, "position", None)
 				x = int(getattr(pos, "x", -1)) if pos is not None else -1
 				y = int(getattr(pos, "y", -1)) if pos is not None else -1
@@ -1195,7 +1300,8 @@ class MainUI:
 						"team": team_id,
 						"x": x,
 						"y": y,
-						"label": f"player{team_id}\n{idx}",
+						"label": self._get_piece_short_code(piece),
+						"is_current": int(getattr(piece, "id", -1)) == current_id,
 					}
 				)
 		return render_pieces
@@ -1503,10 +1609,22 @@ class MainUI:
 
 	def _refresh_board_view(self) -> None:
 		"""刷新棋盘底图和棋子位置。"""
+		# 地图属性选点时，棋盘点击由透明覆盖层接管。
+		# 为避免行动面板残留的“移动目标/火球 AOE”干扰地图编辑，这里暂时屏蔽行动预览绘制。
+		if self.attribute_map_pick_waiting:
+			move_target = None
+			spell_overlay = ([], "#f97316")
+		else:
+			move_target = self._get_move_target_highlight()
+			spell_overlay = self._build_spell_aoe_overlay()
+		trap_markers = self._build_runtime_trap_markers()
 		if self.controller.runtime_source == "runtime_env" and self.controller.environment is not None:
 			map_rows = self._extract_runtime_map_rows()
 			pieces = self._extract_runtime_pieces()
 			self.left_board_panel.set_board_state(map_rows, pieces)
+			self.left_board_panel.set_move_target_highlight(move_target)
+			self.left_board_panel.set_spell_aoe_overlay(spell_overlay[0], spell_overlay[1])
+			self.left_board_panel.set_trap_markers(trap_markers)
 			return
 
 		game_data = self.controller.game_data
@@ -1517,6 +1635,123 @@ class MainUI:
 		map_rows = self._extract_mock_visual_rows()
 		pieces = self._build_mock_pieces_for_current_round()
 		self.left_board_panel.set_board_state(map_rows if isinstance(map_rows, list) else [], pieces)
+		self.left_board_panel.set_move_target_highlight(move_target)
+		self.left_board_panel.set_spell_aoe_overlay([], "#f97316")
+		self.left_board_panel.set_trap_markers([])
+
+	def _build_runtime_trap_markers(self) -> list[dict[str, Any]]:
+		markers: list[dict[str, Any]] = []
+		for trap in self.runtime_trap_effects:
+			remaining = int(trap.get("remaining", 0))
+			if remaining <= 0:
+				continue
+			markers.append(
+				{
+					"x": int(trap.get("x", -1)),
+					"y": int(trap.get("y", -1)),
+					"remaining": remaining,
+				}
+			)
+		return markers
+
+	def _spell_preview_color(self, spell: Any) -> str:
+		name = str(getattr(spell, "name", "")).strip().lower()
+		effect_key = self._spell_effect_key(spell)
+		if "fire" in name or "火" in name:
+			return "#fb7185"
+		if effect_key == "heal":
+			return "#34d399"
+		if effect_key == "move":
+			return "#60a5fa"
+		if effect_key in ("debuff", "damage"):
+			return "#f97316"
+		return "#f59e0b"
+
+	def _build_spell_aoe_overlay(self) -> tuple[list[tuple[int, int]], str]:
+		env = self.controller.environment
+		if self.controller.runtime_source != "runtime_env" or env is None:
+			return [], "#f97316"
+		if self.action_ui_mode.get().strip().lower() != "spell":
+			return [], "#f97316"
+		spell = self._resolve_selected_spell()
+		if spell is None:
+			return [], "#f97316"
+		if self._is_teleport_spell(spell):
+			return [], self._spell_preview_color(spell)
+		if bool(getattr(spell, "is_locking_spell", False)):
+			return [], self._spell_preview_color(spell)
+		try:
+			center_x = int(self.action_spell_point_x_var.get().strip())
+			center_y = int(self.action_spell_point_y_var.get().strip())
+		except Exception:
+			return [], self._spell_preview_color(spell)
+		board = getattr(env, "board", None)
+		width = int(getattr(board, "width", 0)) if board is not None else 0
+		height = int(getattr(board, "height", 0)) if board is not None else 0
+		if width <= 0 or height <= 0:
+			return [], self._spell_preview_color(spell)
+		radius = max(0, int(getattr(spell, "area_radius", 0)))
+		cells: list[tuple[int, int]] = []
+		for x in range(width):
+			for y in range(height):
+				if (x - center_x) ** 2 + (y - center_y) ** 2 <= radius ** 2:
+					cells.append((x, y))
+		return cells, self._spell_preview_color(spell)
+
+	def _get_move_target_highlight(self) -> tuple[int, int] | None:
+		"""返回需要在棋盘高亮的目标格（移动或法术）。"""
+		env = self.controller.environment
+		if self.controller.runtime_source != "runtime_env" or env is None:
+			return None
+
+		mode = self.action_ui_mode.get().strip().lower()
+		if mode == "spell":
+			selected_spell = self._resolve_selected_spell()
+			if selected_spell is None:
+				return None
+			is_locking_spell = bool(getattr(selected_spell, "is_locking_spell", False)) and not self._is_teleport_spell(selected_spell)
+			if is_locking_spell:
+				target_text = self.action_spell_target_var.get().strip()
+				target_piece = self._resolve_spell_target_piece(target_text, selected_spell, self._get_runtime_current_piece(env))
+				if target_piece is None:
+					return None
+				pos = getattr(target_piece, "position", None)
+				tx = int(getattr(pos, "x", -1)) if pos is not None else -1
+				ty = int(getattr(pos, "y", -1)) if pos is not None else -1
+				return (tx, ty) if tx >= 0 and ty >= 0 else None
+			try:
+				target_x = int(self.action_spell_point_x_var.get().strip())
+				target_y = int(self.action_spell_point_y_var.get().strip())
+			except Exception:
+				return None
+			board = getattr(env, "board", None)
+			width = int(getattr(board, "width", 0)) if board is not None else 0
+			height = int(getattr(board, "height", 0)) if board is not None else 0
+			if 0 <= target_x < width and 0 <= target_y < height:
+				return (target_x, target_y)
+			return None
+
+		if mode != "move":
+			return None
+		try:
+			target_x = int(self.action_move_x_var.get().strip())
+			target_y = int(self.action_move_y_var.get().strip())
+		except Exception:
+			return None
+		board = getattr(env, "board", None)
+		width = int(getattr(board, "width", 0)) if board is not None else 0
+		height = int(getattr(board, "height", 0)) if board is not None else 0
+		if not (0 <= target_x < width and 0 <= target_y < height):
+			return None
+		piece = self._get_runtime_current_piece(env)
+		if piece is None:
+			return None
+		pos = getattr(piece, "position", None)
+		curr_x = int(getattr(pos, "x", -1)) if pos is not None else -1
+		curr_y = int(getattr(pos, "y", -1)) if pos is not None else -1
+		if (target_x, target_y) == (curr_x, curr_y):
+			return None
+		return (target_x, target_y)
 
 	def _event_loop_tick(self) -> None:
 		if not self.running:
@@ -1535,7 +1770,9 @@ class MainUI:
 				self.running = False
 				self.loop_job = None
 				self._update_replay_play_pause_button_text()
-				self.right_info_panel.append_content("\n[UI] 对局结束")
+				self.right_info_panel.append_content("\n对局结束")
+				if self.controller.runtime_source == "runtime_env":
+					self._show_game_over_reset_dialog()
 		except Exception as e:
 			self.running = False
 			self.loop_job = None
@@ -1573,6 +1810,7 @@ class MainUI:
 		# 左上信息区：6 个等尺寸卡片，保持区域总体宽高不变。
 		self.left_top_info = ttk.LabelFrame(parent, text="信息展示区", padding=8)
 		self.left_top_info.configure(height=180)
+		self.left_top_info.configure(width=620)
 		self.left_top_info.grid_propagate(False)
 		self.left_top_info.grid(row=0, column=0, sticky="ew", pady=(0, 10))
 
@@ -1589,7 +1827,7 @@ class MainUI:
 		for idx in range(6):
 			card = PieceSquareCard(
 				square_row,
-				width=120,
+				width=96,
 				height=card_height,
 				is_large=True,
 			)
@@ -1603,6 +1841,7 @@ class MainUI:
 		# 左下区域改为真实棋盘组件：20x20 正方形网格。
 		# 棋盘绘制逻辑放在 components.py，主界面只负责装配与摆放。
 		self.left_board_panel = ChessboardPanel(parent, title="棋盘区域（20 x 20）", grid_size=20)
+		self.left_board_panel.configure(width=620)
 		self.left_board_panel.grid(row=1, column=0, sticky="nsew")
 
 	def _build_right_side(self, parent: ttk.Frame) -> None:
@@ -1813,10 +2052,7 @@ class MainUI:
 				piece_team = int(getattr(piece, "team", -1))
 				if piece_team == current_team:
 					continue
-				piece_code = self._get_piece_short_code(piece)
-				x = int(getattr(getattr(piece, "position", None), "x", -1))
-				y = int(getattr(getattr(piece, "position", None), "y", -1))
-				options.append(f"{piece_code} ({x}, {y})")
+				options.append(self._format_action_target_option(piece))
 			if options:
 				return options
 
@@ -1828,10 +2064,34 @@ class MainUI:
 
 		return ["目标A", "目标B"]
 
+	def _format_action_target_option(self, piece: Any) -> str:
+		piece_code = self._get_piece_short_code(piece)
+		x = int(getattr(getattr(piece, "position", None), "x", -1))
+		y = int(getattr(getattr(piece, "position", None), "y", -1))
+		return f"{piece_code} ({x}, {y})"
+
+	def _resolve_action_target_piece(self, selected_text: str) -> Any:
+		env = self.controller.environment
+		if env is None:
+			return None
+		current_piece = self._get_runtime_current_piece(env)
+		current_team = int(getattr(current_piece, "team", -1)) if current_piece is not None else -1
+		for piece in self._coerce_piece_list(getattr(env, "action_queue", [])):
+			if not bool(getattr(piece, "is_alive", False)):
+				continue
+			if int(getattr(piece, "team", -1)) == current_team:
+				continue
+			if self._format_action_target_option(piece) == selected_text:
+				return piece
+		return None
+
 	def _get_piece_short_code(self, piece: Any) -> str:
 		"""返回棋子简称（如 1A、2C），找不到时回退为 ?。"""
 		if piece is None:
 			return "?"
+
+		if not self.runtime_card_slots and self.controller.environment is not None:
+			self._initialize_runtime_card_slots()
 
 		for slot in self.runtime_card_slots:
 			if slot.get("piece") is piece:
@@ -1856,9 +2116,126 @@ class MainUI:
 				piece_code = self._get_piece_short_code(curr)
 				pos = getattr(curr, "position", None)
 				if pos is not None:
-					return f"当前棋子 {piece_code} @ ({int(pos.x)}, {int(pos.y)})"
-				return f"当前棋子 {piece_code}"
-		return "当前棋子"
+					return f"棋子{piece_code}({int(pos.x)},{int(pos.y)})"
+				return f"棋子{piece_code}"
+		return "棋子?(-,-)"
+
+	def _stop_action_move_point_pick(self) -> None:
+		self.action_move_pick_waiting = False
+		self.action_pick_mode = ""
+		overlay = self.action_move_pick_overlay
+		self.action_move_pick_overlay = None
+		if overlay is not None and overlay.winfo_exists():
+			overlay.destroy()
+
+	def _resolve_piece_at_board_xy(self, x: int, y: int) -> Any:
+		env = self.controller.environment
+		if env is None:
+			return None
+		for piece in self._coerce_piece_list(getattr(env, "action_queue", [])):
+			if not bool(getattr(piece, "is_alive", False)):
+				continue
+			pos = getattr(piece, "position", None)
+			px = int(getattr(pos, "x", -1)) if pos is not None else -1
+			py = int(getattr(pos, "y", -1)) if pos is not None else -1
+			if px == x and py == y:
+				return piece
+		return None
+
+	def _on_action_move_pick_overlay_click(self, event: tk.Event) -> str:
+		if not self.action_move_pick_waiting:
+			return "break"
+		board_x, board_y = self.left_board_panel.get_board_xy_from_root(int(event.x_root), int(event.y_root))
+		if board_x is None or board_y is None:
+			self.right_info_panel.append_content("\n[UI] 请选择棋盘中的合法格子")
+			return "break"
+		if self.action_pick_mode == "move":
+			self.action_move_x_var.set(str(board_x))
+			self.action_move_y_var.set(str(board_y))
+			self.right_info_panel.append_content(f"\n[UI] 已选定移动目标: ({board_x}, {board_y})")
+		elif self.action_pick_mode == "spell_point":
+			self.action_spell_point_x_var.set(str(board_x))
+			self.action_spell_point_y_var.set(str(board_y))
+			self.right_info_panel.append_content(f"\n[UI] 已选定法术施用坐标: ({board_x}, {board_y})")
+		elif self.action_pick_mode == "spell_target":
+			selected_piece = self._resolve_piece_at_board_xy(board_x, board_y)
+			if selected_piece is None:
+				self.right_info_panel.append_content("\n[UI] 所点格子没有存活棋子")
+				return "break"
+			selected_option = self._format_action_target_option(selected_piece)
+			if selected_option not in self.action_spell_target_option_map:
+				self.right_info_panel.append_content("\n[UI] 所点棋子不是该法术合法目标")
+				return "break"
+			self.action_spell_target_var.set(selected_option)
+			self.right_info_panel.append_content(f"\n[UI] 已选定法术目标: {selected_option}")
+		else:
+			self.right_info_panel.append_content("\n[UI] 当前不在选点模式")
+			return "break"
+		self._stop_action_move_point_pick()
+		return "break"
+
+	def _begin_action_move_point_pick(self) -> None:
+		if self.controller.runtime_source != "runtime_env" or self.controller.environment is None:
+			self._set_action_feedback("当前模式不支持棋盘选点", False)
+			return
+		self._stop_action_move_point_pick()
+		self.action_move_pick_waiting = True
+		self.action_pick_mode = "move"
+		overlay = tk.Toplevel(self.root)
+		overlay.overrideredirect(True)
+		overlay.attributes("-alpha", 0.01)
+		overlay.attributes("-topmost", True)
+		overlay.lift(self.root)
+		overlay.geometry(
+			f"{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_rootx()}+{self.root.winfo_rooty()}"
+		)
+		overlay.bind("<Button-1>", self._on_action_move_pick_overlay_click)
+		overlay.bind("<ButtonRelease-1>", lambda _e: "break")
+		self.action_move_pick_overlay = overlay
+		self.right_info_panel.append_content("\n[UI] 棋盘选点模式：请点击一个目标格")
+
+	def _begin_action_spell_point_pick(self) -> None:
+		if self.controller.runtime_source != "runtime_env" or self.controller.environment is None:
+			self._set_action_feedback("当前模式不支持法术棋盘选点", False)
+			return
+		self._stop_action_move_point_pick()
+		self.action_move_pick_waiting = True
+		self.action_pick_mode = "spell_point"
+		overlay = tk.Toplevel(self.root)
+		overlay.overrideredirect(True)
+		overlay.attributes("-alpha", 0.01)
+		overlay.attributes("-topmost", True)
+		overlay.lift(self.root)
+		overlay.geometry(
+			f"{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_rootx()}+{self.root.winfo_rooty()}"
+		)
+		overlay.bind("<Button-1>", self._on_action_move_pick_overlay_click)
+		overlay.bind("<ButtonRelease-1>", lambda _e: "break")
+		self.action_move_pick_overlay = overlay
+		self.right_info_panel.append_content("\n[UI] 法术坐标选点：请点击施法中心格")
+
+	def _begin_action_spell_target_pick(self) -> None:
+		if self.controller.runtime_source != "runtime_env" or self.controller.environment is None:
+			self._set_action_feedback("当前模式不支持法术目标选定", False)
+			return
+		if not self.action_spell_target_option_map:
+			self._set_action_feedback("当前法术无有效目标，无法点选", False)
+			return
+		self._stop_action_move_point_pick()
+		self.action_move_pick_waiting = True
+		self.action_pick_mode = "spell_target"
+		overlay = tk.Toplevel(self.root)
+		overlay.overrideredirect(True)
+		overlay.attributes("-alpha", 0.01)
+		overlay.attributes("-topmost", True)
+		overlay.lift(self.root)
+		overlay.geometry(
+			f"{self.root.winfo_width()}x{self.root.winfo_height()}+{self.root.winfo_rootx()}+{self.root.winfo_rooty()}"
+		)
+		overlay.bind("<Button-1>", self._on_action_move_pick_overlay_click)
+		overlay.bind("<ButtonRelease-1>", lambda _e: "break")
+		self.action_move_pick_overlay = overlay
+		self.right_info_panel.append_content("\n[UI] 法术目标选定：请点击合法目标棋子所在格")
 
 	def _build_runtime_turn_round_status(self) -> str:
 		"""构造 runtime 模式下简洁回合信息文本。"""
@@ -1921,19 +2298,38 @@ class MainUI:
 		label = self.action_feedback_label
 		if label is None:
 			return
+		if self.action_feedback_clear_job is not None:
+			try:
+				self.root.after_cancel(self.action_feedback_clear_job)
+			except Exception:
+				pass
+			self.action_feedback_clear_job = None
 		label.configure(text=message, foreground="#059669" if success else "#dc2626")
+		if message:
+			self.action_feedback_clear_job = self.root.after(5000, self._clear_action_feedback)
+
+	def _clear_action_feedback(self) -> None:
+		self.action_feedback_clear_job = None
+		if self.action_feedback_label is not None:
+			self.action_feedback_label.configure(text="")
 
 	def _collapse_action_detail(self) -> None:
+		self._stop_action_move_point_pick()
 		container = self.action_detail_container
 		if container is not None:
 			for widget in container.winfo_children():
 				widget.destroy()
+		self.action_mode_body_container = None
 		if self.action_confirm_button is not None:
 			self.action_confirm_button.pack_forget()
 		self.action_ui_mode.set("")
+		self.action_spell_target_option_map = {}
 
 	def _switch_action_mode(self, mode: str, body_container: ttk.Frame) -> None:
+		self._stop_action_move_point_pick()
+		self.action_spell_target_option_map = {}
 		self.action_ui_mode.set(mode)
+		self.action_mode_body_container = body_container
 		for widget in body_container.winfo_children():
 			widget.destroy()
 		self._render_action_mode_body(body_container)
@@ -1941,78 +2337,560 @@ class MainUI:
 			self.action_confirm_button.pack(side="left", padx=(8, 0))
 		self._set_action_feedback("", True)
 
+	def _rerender_attack_mode_if_needed(self) -> None:
+		if self._rendering_action_mode_body:
+			return
+		if self.action_ui_mode.get().strip().lower() != "attack":
+			return
+		container = self.action_mode_body_container
+		if container is None:
+			return
+		for widget in container.winfo_children():
+			widget.destroy()
+		self._render_action_mode_body(container)
+
+	def _refresh_custom_attack_preview(self) -> None:
+		self.action_custom_preview_var.set("")
+
+	def _on_open_custom_attack_advanced_settings(self) -> None:
+		return
+
+	def _rerender_spell_mode_if_needed(self) -> None:
+		if self._rendering_action_mode_body:
+			return
+		if self.action_ui_mode.get().strip().lower() != "spell":
+			return
+		container = self.action_mode_body_container
+		if container is None:
+			return
+		for widget in container.winfo_children():
+			widget.destroy()
+		self._render_action_mode_body(container)
+
+	def _spell_display_name(self, spell: Any) -> str:
+		name = str(getattr(spell, "name", "法术"))
+		name_map = {
+			"fireball": "火球术",
+			"heal": "治疗术",
+			"arrow hit": "箭击",
+			"arrowhit": "箭击",
+			"trap": "陷阱",
+			"move": "瞬移",
+			"teleport": "瞬移",
+		}
+		alias = name_map.get(name.lower(), "")
+		if alias and alias != name:
+			return f"{alias} ({name})"
+		return name
+
+	def _spell_effect_key(self, spell: Any) -> str:
+		effect = getattr(spell, "effect_type", "")
+		text = str(getattr(effect, "value", effect)).strip()
+		return text.lower()
+
+	def _collect_available_spell_options(self, caster: Any) -> tuple[list[str], dict[str, Any]]:
+		env = self.controller.environment
+		if env is None or caster is None:
+			return ["法术A"], {}
+		fetcher = getattr(env, "get_available_spells", None)
+		if not callable(fetcher):
+			return ["法术A"], {}
+		spells = [s for s in self._coerce_piece_list(fetcher(caster)) if s is not None]
+		# 测试阶段：补齐完整法术池，避免因职业筛选导致调试缺失法术。
+		try:
+			for extra_spell in self._coerce_piece_list(SpellFactory.get_all_spells()):
+				if extra_spell is None:
+					continue
+				spell_id = int(getattr(extra_spell, "id", -1))
+				if any(int(getattr(s, "id", -2)) == spell_id for s in spells):
+					continue
+				spells.append(extra_spell)
+		except Exception:
+			pass
+		if not spells:
+			return ["法术A"], {}
+		option_map: dict[str, Any] = {}
+		options: list[str] = []
+		for spell in spells:
+			name = self._spell_display_name(spell)
+			is_locking = bool(getattr(spell, "is_locking_spell", False))
+			target_text = "锁定" if is_locking else "非锁定"
+			option = f"{name} [{target_text}]"
+			option_map[option] = spell
+			options.append(option)
+		return options, option_map
+
+	def _resolve_selected_spell(self) -> Any:
+		selected = self.action_spell_type_var.get().strip()
+		return self.action_spell_option_map.get(selected)
+
+	def _collect_spell_target_options(self, spell: Any, caster: Any) -> list[str]:
+		env = self.controller.environment
+		if env is None or spell is None or caster is None:
+			return []
+		fetcher = getattr(env, "get_spell_targets", None)
+		if callable(fetcher):
+			targets = [t for t in self._coerce_piece_list(fetcher(spell, caster)) if t is not None]
+			return [self._format_action_target_option(t) for t in targets]
+		return []
+
+	def _resolve_spell_target_piece(self, selected_text: str, spell: Any, caster: Any) -> Any:
+		mapped_piece = self.action_spell_target_option_map.get(selected_text)
+		if mapped_piece is not None:
+			return mapped_piece
+		env = self.controller.environment
+		if env is None:
+			return None
+		fetcher = getattr(env, "get_spell_targets", None)
+		candidates: list[Any] = []
+		if callable(fetcher):
+			candidates = [t for t in self._coerce_piece_list(fetcher(spell, caster)) if t is not None]
+		else:
+			candidates = [p for p in self._coerce_piece_list(getattr(env, "action_queue", [])) if bool(getattr(p, "is_alive", False))]
+		for piece in candidates:
+			if self._format_action_target_option(piece) == selected_text:
+				return piece
+		return None
+
+	def _collect_area_spell_targets(self, env: Any, caster: Any, spell: Any, area: Any) -> list[Any]:
+		effect_key = self._spell_effect_key(spell)
+		targets: list[Any] = []
+		for piece in self._coerce_piece_list(getattr(env, "action_queue", [])):
+			if not bool(getattr(piece, "is_alive", False)):
+				continue
+			contains = bool(getattr(area, "contains", lambda _p: False)(getattr(piece, "position", None)))
+			if not contains:
+				continue
+			if effect_key in ("damage", "debuff"):
+				if int(getattr(piece, "team", -1)) != int(getattr(caster, "team", -2)):
+					targets.append(piece)
+			elif effect_key in ("heal", "buff"):
+				if int(getattr(piece, "team", -1)) == int(getattr(caster, "team", -2)):
+					targets.append(piece)
+			elif effect_key == "move":
+				if piece is caster:
+					targets.append(piece)
+			else:
+				targets.append(piece)
+		return targets
+
+	def _is_teleport_spell(self, spell: Any) -> bool:
+		effect_key = self._spell_effect_key(spell)
+		name = str(getattr(spell, "name", "")).strip().lower()
+		return effect_key == "move" or name in ("teleport", "move")
+
+	def _is_trap_spell(self, spell: Any) -> bool:
+		name = str(getattr(spell, "name", "")).strip().lower()
+		return bool(getattr(spell, "is_delay_spell", False)) or "trap" in name
+
+	def _apply_custom_teleport_spell(self, env: Any, caster: Any, spell: Any, spell_cost: int) -> tuple[bool, str, list[str], dict[str, int]]:
+		try:
+			tx = int(self.action_spell_point_x_var.get().strip())
+			ty = int(self.action_spell_point_y_var.get().strip())
+		except Exception:
+			return False, "行动失败：请输入合法瞬移坐标", [], {}
+
+		board = getattr(env, "board", None)
+		width = int(getattr(board, "width", 0)) if board is not None else 0
+		height = int(getattr(board, "height", 0)) if board is not None else 0
+		if not (0 <= tx < width and 0 <= ty < height):
+			return False, "行动失败：瞬移坐标越界", [], {}
+
+		if board is not None:
+			try:
+				height_map = getattr(board, "height_map", None)
+				if height_map is not None and int(height_map[tx][ty]) == -1:
+					return False, "行动失败：目标地块不可传送", [], {}
+			except Exception:
+				return False, "行动失败：目标地块不可访问", [], {}
+
+		occupant = self._resolve_piece_at_board_xy(tx, ty)
+		if occupant is not None and occupant is not caster:
+			return False, "行动失败：目标格已有其他棋子", [], {}
+
+		old_pos = getattr(caster, "position", None)
+		old_x = int(getattr(old_pos, "x", -1)) if old_pos is not None else -1
+		old_y = int(getattr(old_pos, "y", -1)) if old_pos is not None else -1
+		if (old_x, old_y) == (tx, ty):
+			return False, "行动失败：当前已在目标格", [], {}
+
+		if board is not None:
+			try:
+				old_cell = board.grid[old_x][old_y]
+				new_cell = board.grid[tx][ty]
+				old_cell.state = 1
+				old_cell.player_id = 0
+				old_cell.piece_id = -1
+				new_cell.state = 2
+				new_cell.player_id = int(getattr(caster, "team", 0))
+				new_cell.piece_id = int(getattr(caster, "id", -1))
+			except Exception:
+				pass
+
+		caster.get_accessor().set_position(Point(tx, ty))
+		caster.get_accessor().change_action_points_by(-1)
+		caster.get_accessor().change_spell_slots_by(-spell_cost)
+		summary = f"瞬移到({tx},{ty})，AP/SP 已消耗"
+		return True, summary, [], {}
+
+	def _place_runtime_trap_spell(self, env: Any, caster: Any, spell: Any, spell_cost: int) -> tuple[bool, str, list[str], dict[str, int]]:
+		try:
+			tx = int(self.action_spell_point_x_var.get().strip())
+			ty = int(self.action_spell_point_y_var.get().strip())
+		except Exception:
+			return False, "行动失败：请输入合法陷阱坐标", [], {}
+
+		board = getattr(env, "board", None)
+		width = int(getattr(board, "width", 0)) if board is not None else 0
+		height = int(getattr(board, "height", 0)) if board is not None else 0
+		if not (0 <= tx < width and 0 <= ty < height):
+			return False, "行动失败：陷阱坐标越界", [], {}
+
+		base_lifespan = max(1, int(getattr(spell, "base_lifespan", 1)))
+		base_value = max(0, int(getattr(spell, "base_value", 0)))
+		trap = {
+			"x": tx,
+			"y": ty,
+			"remaining": base_lifespan,
+			"damage": base_value,
+			"spell_name": self._spell_display_name(spell),
+			"caster_team": int(getattr(caster, "team", -1)),
+		}
+		self.runtime_trap_effects.append(trap)
+		caster.get_accessor().change_action_points_by(-1)
+		caster.get_accessor().change_spell_slots_by(-spell_cost)
+
+		# 若该格已有“非当前行动”的棋子，则陷阱在施放完成后立即触发并消失。
+		occupant = self._resolve_piece_at_board_xy(tx, ty)
+		if occupant is not None and occupant is not caster and bool(getattr(occupant, "is_alive", True)):
+			self._try_trigger_runtime_trap_on_piece(
+				env,
+				occupant,
+				reason="施放完成触发",
+			)
+
+		summary = f"在({tx},{ty})放置陷阱，持续{base_lifespan}回合"
+		return True, summary, [], {}
+
+	def _pop_runtime_trap_at_xy(self, x: int, y: int) -> dict[str, Any] | None:
+		for trap in list(self.runtime_trap_effects):
+			if int(trap.get("remaining", 0)) <= 0:
+				continue
+			if int(trap.get("x", -1)) == int(x) and int(trap.get("y", -1)) == int(y):
+				try:
+					self.runtime_trap_effects.remove(trap)
+				except ValueError:
+					pass
+				return trap
+		return None
+
+	def _handle_death_check_if_possible(self, env: Any, piece: Any) -> None:
+		try:
+			if env is not None and callable(getattr(env, "handle_death_check", None)):
+				env.handle_death_check(piece)
+		except Exception:
+			return
+
+	def _try_trigger_runtime_trap_on_piece(self, env: Any, piece: Any, *, reason: str) -> int | None:
+		if piece is None or not bool(getattr(piece, "is_alive", True)):
+			return None
+		pos = getattr(piece, "position", None)
+		x = int(getattr(pos, "x", -1)) if pos is not None else -1
+		y = int(getattr(pos, "y", -1)) if pos is not None else -1
+		trap = self._pop_runtime_trap_at_xy(x, y)
+		if trap is None:
+			return None
+
+		damage = max(0, int(trap.get("damage", 0)))
+		old_hp = int(getattr(piece, "health", 0))
+		try:
+			if callable(getattr(piece, "receive_damage", None)):
+				piece.receive_damage(damage, "physical")
+			else:
+				setattr(piece, "health", max(0, old_hp - damage))
+		except Exception:
+			setattr(piece, "health", max(0, old_hp - damage))
+		new_hp = int(getattr(piece, "health", 0))
+		real = max(0, old_hp - new_hp)
+		code = self._get_piece_short_code(piece)
+
+		self._handle_death_check_if_possible(env, piece)
+		self._append_runtime_action_log(
+			actor_code="TRAP",
+			action_label=f"触发@({x},{y})",
+			summary=f"{reason}，造成{real}点伤害，陷阱消失",
+			targets=[code],
+			damage_by_target={code: real},
+		)
+		self._append_runtime_death_and_game_over_info(piece, code)
+		return real
+
+	def _tick_runtime_traps(self, env: Any, *, round_advanced: bool) -> None:
+		"""按“回合”更新陷阱寿命。
+
+		- 每进入新一轮(所有存活棋子行动时段结束一次)才递减 remaining
+		- remaining 归零的陷阱自动消散
+		- 触发伤害由动作执行后/行动时段结束时单独判定
+		"""
+		if not round_advanced or not self.runtime_trap_effects:
+			return
+		next_traps: list[dict[str, Any]] = []
+		for trap in self.runtime_trap_effects:
+			remaining = int(trap.get("remaining", 0)) - 1
+			if remaining <= 0:
+				continue
+			trap["remaining"] = remaining
+			next_traps.append(trap)
+		self.runtime_trap_effects = next_traps
+
+	def _append_attack_formula_info(
+		self,
+		attack_type: str,
+		attacker: Any,
+		target: Any,
+		*,
+		attack_roll: int | None,
+		raw_damage: int,
+		real_damage: int,
+		is_hit: bool,
+	) -> None:
+		env = self.controller.environment
+		if env is None:
+			return
+		step_func = getattr(env, "step_modified_func", None)
+		if not callable(step_func):
+			return
+
+		advantage_func = getattr(env, "calculate_advantage_value", None)
+		advantage_impl = callable(advantage_func)
+		adv_value = 0
+		if advantage_impl:
+			try:
+				adv_value = int(advantage_func(attacker, target))
+			except Exception:
+				adv_value = 0
+
+		attack_name = "物理攻击" if attack_type == "物理攻击" else "普通法术攻击"
+		roll_value = int(attack_roll) if attack_roll is not None else -1
+
+		if attack_type == "普通法术攻击":
+			attack_part = int(step_func(int(getattr(attacker, "intelligence", 0))))
+			resist_part = int(getattr(target, "magic_resist", 0))
+			left_total = roll_value + attack_part + int(adv_value) if roll_value >= 0 else None
+			right_total = resist_part
+			symbol = ">" if (left_total is not None and left_total > right_total) else "<="
+
+			if roll_value == 1:
+				self.right_info_panel.append_content(
+					f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{attack_part}(智力)+{int(adv_value)}(优势值) {symbol} "
+					f"{resist_part}(法术豁免)；即 {left_total} {symbol} {right_total}，但天然1直接未命中"
+				)
+			elif roll_value == 20:
+				self.right_info_panel.append_content(
+					f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{attack_part}(智力)+{int(adv_value)}(优势值) {symbol} "
+					f"{resist_part}(法术豁免)；即 {left_total} {symbol} {right_total}，天然20直接命中"
+				)
+			elif left_total is not None:
+				self.right_info_panel.append_content(
+					f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{attack_part}(智力)+{int(adv_value)}(优势值) {symbol} "
+					f"{resist_part}(法术豁免)；即 {left_total} {symbol} {right_total}"
+				)
+			else:
+				self.right_info_panel.append_content(f"\n[公式] {attack_name}命中判定：未捕获到投掷值")
+
+			if not advantage_impl:
+				self.right_info_panel.append_content("\n[公式] 优势值：未实现，按 0 处理")
+
+			base_damage = int(getattr(attacker, "magic_damage", 0))
+			if not is_hit:
+				self.right_info_panel.append_content(
+					f"\n[公式] 伤害计算：未命中，本次原始伤害=0；实际伤害=0"
+				)
+			else:
+				crit_text = " x2(暴击)" if roll_value == 20 else ""
+				self.right_info_panel.append_content(
+					f"\n[公式] 伤害计算：原始伤害={base_damage}(法伤){crit_text}={raw_damage}；"
+					f"实际伤害=max(0, {raw_damage}-{resist_part})={real_damage}"
+				)
+			return
+
+		strength_part = int(step_func(int(getattr(attacker, "strength", 0))))
+		dex_part = int(step_func(int(getattr(target, "dexterity", 0))))
+		resist_part = int(getattr(target, "physical_resist", 0))
+		left_total = roll_value + strength_part + int(adv_value) if roll_value >= 0 else None
+		right_total = resist_part + dex_part
+		symbol = ">" if (left_total is not None and left_total > right_total) else "<="
+
+		if roll_value == 1:
+			self.right_info_panel.append_content(
+				f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{strength_part}(力量)+{int(adv_value)}(优势值) {symbol} "
+				f"{resist_part}(物理豁免)+{dex_part}(敏捷)；即 {left_total} {symbol} {right_total}，但天然1直接未命中"
+			)
+		elif roll_value == 20:
+			self.right_info_panel.append_content(
+				f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{strength_part}(力量)+{int(adv_value)}(优势值) {symbol} "
+				f"{resist_part}(物理豁免)+{dex_part}(敏捷)；即 {left_total} {symbol} {right_total}，天然20直接命中"
+			)
+		elif left_total is not None:
+			self.right_info_panel.append_content(
+				f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{strength_part}(力量)+{int(adv_value)}(优势值) {symbol} "
+				f"{resist_part}(物理豁免)+{dex_part}(敏捷)；即 {left_total} {symbol} {right_total}"
+			)
+		else:
+			self.right_info_panel.append_content(f"\n[公式] {attack_name}命中判定：未捕获到投掷值")
+
+		if not advantage_impl:
+			self.right_info_panel.append_content("\n[公式] 优势值：未实现，按 0 处理")
+
+		base_damage = int(getattr(attacker, "physical_damage", 0))
+		if not is_hit:
+			self.right_info_panel.append_content(
+				f"\n[公式] 伤害计算：未命中，本次原始伤害=0；实际伤害=0"
+			)
+		else:
+			crit_text = " x2(暴击)" if roll_value == 20 else ""
+			self.right_info_panel.append_content(
+				f"\n[公式] 伤害计算：原始伤害={base_damage}(物伤){crit_text}={raw_damage}；"
+				f"实际伤害=max(0, {raw_damage}-{resist_part})={real_damage}"
+			)
+
+	def _append_runtime_death_and_game_over_info(self, target_piece: Any, target_code: str) -> None:
+		env = self.controller.environment
+		if env is None:
+			return
+		if target_piece is not None and not bool(getattr(target_piece, "is_alive", True)):
+			self.right_info_panel.append_content(f"\n棋子 {target_code} 已死亡")
+
+		p1_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player1", None), "pieces", [])))
+		p2_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player2", None), "pieces", [])))
+		if not (p1_alive and p2_alive):
+			winner = "玩家1" if p1_alive else ("玩家2" if p2_alive else "无人")
+			setattr(env, "is_game_over", True)
+			self.right_info_panel.append_content(f"\n游戏结束，胜者：{winner}")
+			if self.controller.runtime_source == "runtime_env":
+				self._show_game_over_reset_dialog()
+
 	def _render_action_mode_body(self, body_container: ttk.Frame) -> None:
-		mode = self.action_ui_mode.get().strip().lower()
+		self._rendering_action_mode_body = True
+		try:
+			mode = self.action_ui_mode.get().strip().lower()
 
-		if mode == "move":
-			row = ttk.Frame(body_container)
-			row.pack(fill="x")
-			actor_text = self._get_current_actor_text()
-			self.action_move_piece_var.set(actor_text)
-			ttk.Label(row, text="移动").pack(side="left")
-			ttk.Entry(row, textvariable=self.action_move_piece_var, width=22, state="readonly").pack(side="left", padx=(4, 4))
-			ttk.Label(row, text="到 (").pack(side="left")
-			tk.Entry(row, textvariable=self.action_move_x_var, width=4).pack(side="left")
-			ttk.Label(row, text=", ").pack(side="left")
-			tk.Entry(row, textvariable=self.action_move_y_var, width=4).pack(side="left")
-			ttk.Label(row, text=")").pack(side="left")
-			return
+			if mode == "move":
+				row = ttk.Frame(body_container)
+				row.pack(fill="x")
+				actor_text = self._get_current_actor_text()
+				self.action_move_piece_var.set(actor_text)
+				ttk.Label(row, text="移动").pack(side="left")
+				ttk.Entry(row, textvariable=self.action_move_piece_var, width=12, state="readonly").pack(side="left", padx=(4, 4))
+				ttk.Label(row, text="到 (").pack(side="left")
+				tk.Entry(row, textvariable=self.action_move_x_var, width=3).pack(side="left")
+				ttk.Label(row, text=", ").pack(side="left")
+				tk.Entry(row, textvariable=self.action_move_y_var, width=3).pack(side="left")
+				ttk.Label(row, text=")").pack(side="left")
+				ttk.Button(row, text="棋盘选点", command=self._begin_action_move_point_pick).pack(side="left", padx=(6, 0))
+				return
 
-		target_options = self._collect_action_target_options()
+			target_options = self._collect_action_target_options()
 
-		if mode == "attack":
-			attack_types = ["物理攻击", "法术攻击", "卓越攻击"]
-			if not self.action_attack_target_var.get().strip() or self.action_attack_target_var.get() not in target_options:
-				self.action_attack_target_var.set(target_options[0])
-			if not self.action_attack_type_var.get().strip() or self.action_attack_type_var.get() not in attack_types:
-				self.action_attack_type_var.set(attack_types[0])
+			if mode == "attack":
+				attack_types = ["物理攻击", "普通法术攻击", "定制攻击"]
+				if not self.action_attack_target_var.get().strip() or self.action_attack_target_var.get() not in target_options:
+					self.action_attack_target_var.set(target_options[0])
+				if not self.action_attack_type_var.get().strip() or self.action_attack_type_var.get() not in attack_types:
+					self.action_attack_type_var.set(attack_types[0])
 
-			row = ttk.Frame(body_container)
-			row.pack(fill="x")
-			ttk.Label(row, text="对").pack(side="left")
-			ttk.Combobox(
-				row,
-				textvariable=self.action_attack_target_var,
-				values=target_options,
+				row = ttk.Frame(body_container)
+				row.pack(fill="x")
+				ttk.Label(row, text="对").pack(side="left")
+				ttk.Combobox(
+					row,
+					textvariable=self.action_attack_target_var,
+					values=target_options,
+					state="readonly",
+					width=18,
+				).pack(side="left", padx=(4, 4))
+				ttk.Label(row, text="使用").pack(side="left")
+				attack_type_combo = ttk.Combobox(
+					row,
+					textvariable=self.action_attack_type_var,
+					values=attack_types,
+					state="readonly",
+					width=12,
+				)
+				attack_type_combo.pack(side="left", padx=(4, 4))
+				attack_type_combo.bind("<<ComboboxSelected>>", lambda _e: self._rerender_attack_mode_if_needed())
+				ttk.Label(row, text="。").pack(side="left")
+
+				if self.action_attack_type_var.get().strip() == "定制攻击":
+					row2 = ttk.Frame(body_container)
+					row2.pack(fill="x", pady=(6, 0))
+					ttk.Label(row2, text="造成").pack(side="left")
+					tk.Entry(row2, textvariable=self.action_custom_damage_var, width=6).pack(side="left", padx=(4, 4))
+					ttk.Label(row2, text="真实伤害").pack(side="left", padx=(0, 8))
+					ttk.Button(row2, text="高级设置", command=self._on_open_custom_attack_advanced_settings).pack(side="left", padx=(0, 8))
+					ttk.Label(row2, text="(测试用)", foreground="#6b7280").pack(side="left")
+				return
+
+			env = self.controller.environment
+			caster = self._get_runtime_current_piece(env) if env is not None else None
+			spell_options, spell_option_map = self._collect_available_spell_options(caster)
+			self.action_spell_option_map = spell_option_map
+			if not self.action_spell_type_var.get().strip() or self.action_spell_type_var.get() not in spell_options:
+				self.action_spell_type_var.set(spell_options[0])
+
+			row1 = ttk.Frame(body_container)
+			row1.pack(fill="x")
+			ttk.Label(row1, text="施用").pack(side="left")
+			spell_combo = ttk.Combobox(
+				row1,
+				textvariable=self.action_spell_type_var,
+				values=spell_options,
 				state="readonly",
-				width=18,
-			).pack(side="left", padx=(4, 4))
-			ttk.Label(row, text="使用").pack(side="left")
-			ttk.Combobox(
-				row,
-				textvariable=self.action_attack_type_var,
-				values=attack_types,
-				state="readonly",
-				width=12,
-			).pack(side="left", padx=(4, 4))
-			ttk.Label(row, text="。").pack(side="left")
-			return
+				width=26,
+			)
+			spell_combo.pack(side="left", padx=(4, 4))
+			spell_combo.bind("<<ComboboxSelected>>", lambda _e: self._rerender_spell_mode_if_needed())
+			ttk.Label(row1, text="法术。").pack(side="left")
 
-		spell_types = ["火球术", "治疗术", "护盾术", "位移术"]
-		if not self.action_spell_target_var.get().strip() or self.action_spell_target_var.get() not in target_options:
-			self.action_spell_target_var.set(target_options[0])
-		if not self.action_spell_type_var.get().strip() or self.action_spell_type_var.get() not in spell_types:
-			self.action_spell_type_var.set(spell_types[0])
+			selected_spell = self._resolve_selected_spell()
+			if selected_spell is None:
+				return
 
-		row = ttk.Frame(body_container)
-		row.pack(fill="x")
-		ttk.Label(row, text="对").pack(side="left")
-		ttk.Combobox(
-			row,
-			textvariable=self.action_spell_target_var,
-			values=target_options,
-			state="readonly",
-			width=18,
-		).pack(side="left", padx=(4, 4))
-		ttk.Label(row, text="施放").pack(side="left")
-		ttk.Combobox(
-			row,
-			textvariable=self.action_spell_type_var,
-			values=spell_types,
-			state="readonly",
-			width=12,
-		).pack(side="left", padx=(4, 4))
-		ttk.Label(row, text="。").pack(side="left")
+			is_locking_spell = bool(getattr(selected_spell, "is_locking_spell", False)) and not self._is_teleport_spell(selected_spell)
+			row2 = ttk.Frame(body_container)
+			row2.pack(fill="x", pady=(6, 0))
+			if is_locking_spell:
+				target_candidates = self._collect_spell_target_options(selected_spell, caster)
+				self.action_spell_target_option_map = {}
+				for option in target_candidates:
+					piece = self._resolve_spell_target_piece(option, selected_spell, caster)
+					if piece is not None:
+						self.action_spell_target_option_map[option] = piece
+				if not target_candidates:
+					target_candidates = ["无有效目标"]
+				if not self.action_spell_target_var.get().strip() or self.action_spell_target_var.get() not in target_candidates:
+					self.action_spell_target_var.set(target_candidates[0])
+				ttk.Label(row2, text="对").pack(side="left")
+				ttk.Combobox(
+					row2,
+					textvariable=self.action_spell_target_var,
+					values=target_candidates,
+					state="readonly",
+					width=18,
+				).pack(side="left", padx=(4, 4))
+				ttk.Button(row2, text="棋子点选", command=self._begin_action_spell_target_pick).pack(side="left", padx=(4, 4))
+				ttk.Label(row2, text="施用").pack(side="left")
+			else:
+				self.action_spell_target_option_map = {}
+				ttk.Label(row2, text="在 (").pack(side="left")
+				tk.Entry(row2, textvariable=self.action_spell_point_x_var, width=4).pack(side="left")
+				ttk.Label(row2, text=", ").pack(side="left")
+				tk.Entry(row2, textvariable=self.action_spell_point_y_var, width=4).pack(side="left")
+				ttk.Label(row2, text=") 处施用").pack(side="left")
+				ttk.Button(row2, text="棋盘选点", command=self._begin_action_spell_point_pick).pack(side="left", padx=(4, 4))
+			ttk.Label(row2, text="。", foreground="#6b7280").pack(side="left")
+		finally:
+			self._rendering_action_mode_body = False
 
 	def _on_preview_submit_action(self) -> None:
 		mode = self.action_ui_mode.get().strip().lower()
@@ -2038,16 +2916,28 @@ class MainUI:
 			old_x = int(getattr(old_pos, "x", -1)) if old_pos is not None else -1
 			old_y = int(getattr(old_pos, "y", -1)) if old_pos is not None else -1
 			old_ap = int(getattr(current_piece, "action_points", 0))
+			setattr(env, "current_piece", current_piece)
+			target_x = int(getattr(action.move_target, "x", -1))
+			target_y = int(getattr(action.move_target, "y", -1))
 
 			env.execute_player_action(action)
+
+			# 仅在 UI 层兜底：若 env 只更新棋盘占位而未同步 piece.position，则在这里补齐。
+			board_after = getattr(env, "board", None)
+			try:
+				if board_after is not None:
+					cell_after = board_after.grid[target_x][target_y]
+					if int(getattr(cell_after, "state", 0)) == 2 and int(getattr(cell_after, "piece_id", -1)) == int(getattr(current_piece, "id", -2)):
+						accessor = current_piece.get_accessor()
+						accessor.set_position(Point(target_x, target_y))
+			except Exception:
+				pass
 
 			new_pos = getattr(current_piece, "position", None)
 			new_x = int(getattr(new_pos, "x", -1)) if new_pos is not None else -1
 			new_y = int(getattr(new_pos, "y", -1)) if new_pos is not None else -1
 			new_ap = int(getattr(current_piece, "action_points", 0))
 
-			target_x = int(getattr(action.move_target, "x", -1))
-			target_y = int(getattr(action.move_target, "y", -1))
 			if (new_x, new_y) != (target_x, target_y):
 				self._set_action_feedback("行动失败：移动未生效（非法路径或规则限制）", False)
 				self.right_info_panel.append_content(
@@ -2060,27 +2950,395 @@ class MainUI:
 				action_label="移动",
 				summary=f"({old_x}, {old_y}) -> ({new_x}, {new_y})，AP {old_ap}->{new_ap}",
 			)
+			self._try_trigger_runtime_trap_on_piece(env, current_piece, reason="移动完成触发")
 			self._set_action_feedback("行动成功", True)
 			self._update_cards_from_env()
 			self._refresh_piece_cards()
 			self._refresh_board_view()
 			return
 		elif mode == "attack":
-			target = self.action_attack_target_var.get().strip() or "目标"
-			attack_type = self.action_attack_type_var.get().strip() or "攻击"
-			message = f"[UI] 行动暂未实现：对 {target} 使用 {attack_type}"
-			self._set_action_feedback("行动失败：攻击暂未实现", False)
+			env = self.controller.environment
+			if env is None:
+				self._set_action_feedback("行动失败：环境未初始化", False)
+				return
+
+			current_piece = self._get_runtime_current_piece(env)
+			if current_piece is None:
+				self._set_action_feedback("行动失败：未定位到当前行动棋子", False)
+				return
+
+			target_label = self.action_attack_target_var.get().strip()
+			target_piece = self._resolve_action_target_piece(target_label)
+			if target_piece is None:
+				self._set_action_feedback("行动失败：攻击目标无效", False)
+				self.right_info_panel.append_content(f"\n[UI] 攻击失败：无法识别目标 {target_label or '目标'}")
+				return
+
+			attack_type = self.action_attack_type_var.get().strip() or "物理攻击"
+			target_code = self._get_piece_short_code(target_piece)
+			old_ap = int(getattr(current_piece, "action_points", 0))
+			old_hp = int(getattr(target_piece, "health", 0))
+
+			if attack_type == "定制攻击":
+				try:
+					custom_damage = int(self.action_custom_damage_var.get().strip())
+				except Exception:
+					self._set_action_feedback("行动失败：真实伤害必须是整数", False)
+					return
+				if custom_damage <= 0:
+					self._set_action_feedback("行动失败：真实伤害必须大于 0", False)
+					return
+
+				target_piece.get_accessor().set_health_to(max(old_hp - custom_damage, 0))
+				if int(getattr(target_piece, "health", 0)) <= 0:
+					env.handle_death_check(target_piece)
+				self._append_runtime_action_log(
+					actor_code=self._get_piece_short_code(current_piece),
+					action_label="定制攻击",
+					summary=f"对{target_code}造成{custom_damage}点真实伤害（不受AP/范围限制）",
+					targets=[target_code],
+					damage_by_target={target_code: custom_damage},
+				)
+				self._append_runtime_death_and_game_over_info(target_piece, target_code)
+				self._set_action_feedback("行动成功", True)
+				self._update_cards_from_env()
+				self._refresh_piece_cards()
+				self._refresh_board_view()
+				return
+
+			if int(getattr(current_piece, "action_points", 0)) <= 0:
+				self._set_action_feedback("行动失败：当前棋子行动位不足", False)
+				return
+
+			if not bool(env.is_in_attack_range(current_piece, target_piece)):
+				self._set_action_feedback("行动失败：本次攻击无法执行，超出攻击范围", False)
+				self.right_info_panel.append_content("\n[UI] 攻击失败：本次攻击无法执行，超出攻击范围")
+				return
+
+			attack_label = "物理攻击" if attack_type == "物理攻击" else "普通法术攻击"
+			attack_roll: int | None = None
+			raw_damage = 0
+
+			if attack_type == "物理攻击":
+				attack_context = AttackContext()
+				attack_context.attacker = current_piece
+				attack_context.target = target_piece
+
+				action = ActionSet()
+				action.move = False
+				action.attack = True
+				action.attack_context = attack_context
+				action.spell = False
+
+				setattr(env, "current_piece", current_piece)
+				captured_rolls: list[int] = []
+				original_roll = getattr(env, "roll_dice", None)
+				wrapped_roll = False
+				if callable(original_roll):
+					def _roll_proxy(n: int, sides: int):
+						value = original_roll(n, sides)
+						if int(n) == 1 and int(sides) == 20:
+							captured_rolls.append(int(value))
+						return value
+					setattr(env, "roll_dice", _roll_proxy)
+					wrapped_roll = True
+				try:
+					env.execute_player_action(action)
+				finally:
+					if wrapped_roll:
+						setattr(env, "roll_dice", original_roll)
+
+				attack_roll = int(captured_rolls[0]) if captured_rolls else None
+				raw_damage = int(getattr(attack_context, "damage_dealt", 0))
+			else:
+				step_func = getattr(env, "step_modified_func", None)
+				if not callable(step_func):
+					self._set_action_feedback("行动失败：普通法术攻击缺少规则函数", False)
+					return
+
+				advantage_func = getattr(env, "calculate_advantage_value", None)
+				adv_value = 0
+				if callable(advantage_func):
+					try:
+						adv_value = int(advantage_func(current_piece, target_piece))
+					except Exception:
+						adv_value = 0
+
+				attack_roll = int(getattr(env, "roll_dice")(1, 20))
+				if attack_roll == 1:
+					is_hit = False
+					is_critical = False
+				elif attack_roll == 20:
+					is_hit = True
+					is_critical = True
+				else:
+					attack_throw = attack_roll + int(step_func(int(getattr(current_piece, "intelligence", 0)))) + int(adv_value)
+					defense_value = int(getattr(target_piece, "magic_resist", 0))
+					is_hit = bool(attack_throw > defense_value)
+					is_critical = False
+
+				if is_hit:
+					raw_damage = int(getattr(current_piece, "magic_damage", 0))
+					if is_critical:
+						raw_damage *= 2
+					target_piece.receive_damage(raw_damage, "magic")
+					if int(getattr(target_piece, "health", 0)) <= 0:
+						env.handle_death_check(target_piece)
+
+				current_piece.get_accessor().change_action_points_by(-1)
+
+			new_ap = int(getattr(current_piece, "action_points", 0))
+			new_hp = int(getattr(target_piece, "health", 0))
+			real_damage = max(0, old_hp - new_hp)
+
+			if raw_damage > 0:
+				summary = f"命中，造成{real_damage}点伤害，AP {old_ap}->{new_ap}"
+			else:
+				summary = f"未命中，AP {old_ap}->{new_ap}"
+
+			self._append_runtime_action_log(
+				actor_code=self._get_piece_short_code(current_piece),
+				action_label=attack_label,
+				summary=summary,
+				targets=[target_code],
+				damage_by_target={target_code: real_damage},
+			)
+			self._append_attack_formula_info(
+				attack_label,
+				current_piece,
+				target_piece,
+				attack_roll=attack_roll,
+				raw_damage=raw_damage,
+				real_damage=real_damage,
+				is_hit=(raw_damage > 0),
+			)
+			self._append_runtime_death_and_game_over_info(target_piece, target_code)
+			self._set_action_feedback("行动成功", True)
+			self._update_cards_from_env()
+			self._refresh_piece_cards()
+			self._refresh_board_view()
+			return
 		else:
-			target = self.action_spell_target_var.get().strip() or "目标"
-			spell = self.action_spell_type_var.get().strip() or "法术"
-			message = f"[UI] 行动暂未实现：对 {target} 施放 {spell}"
-			self._set_action_feedback("行动失败：法术暂未实现", False)
+			env = self.controller.environment
+			if env is None:
+				self._set_action_feedback("行动失败：环境未初始化", False)
+				return
+
+			caster = self._get_runtime_current_piece(env)
+			if caster is None:
+				self._set_action_feedback("行动失败：未定位到当前行动棋子", False)
+				return
+
+			spell = self._resolve_selected_spell()
+			if spell is None:
+				self._set_action_feedback("行动失败：法术无效", False)
+				return
+
+			old_ap = int(getattr(caster, "action_points", 0))
+			old_sp = int(getattr(caster, "spell_slots", 0))
+			if old_ap <= 0:
+				self._set_action_feedback("行动失败：当前棋子行动位不足", False)
+				return
+
+			spell_cost = int(getattr(spell, "spell_cost", 1))
+			if old_sp < spell_cost:
+				self._set_action_feedback("行动失败：当前棋子法术位不足", False)
+				return
+
+			spell_name = self._spell_display_name(spell)
+			spell_range = float(getattr(spell, "range", 0.0))
+			is_locking_spell = bool(getattr(spell, "is_locking_spell", False))
+			area_radius = int(getattr(spell, "area_radius", 0))
+			is_teleport_spell = self._is_teleport_spell(spell)
+			is_trap_spell = self._is_trap_spell(spell)
+
+			target_piece = None
+			target_area = None
+			target_codes: list[str] = []
+			target_pieces: list[Any] = []
+			before_hp: dict[int, int] = {}
+
+			caster_pos = getattr(caster, "position", None)
+			caster_x = int(getattr(caster_pos, "x", -1)) if caster_pos is not None else -1
+			caster_y = int(getattr(caster_pos, "y", -1)) if caster_pos is not None else -1
+
+			if is_teleport_spell:
+				success, summary, target_codes, damage_by_target = self._apply_custom_teleport_spell(env, caster, spell, spell_cost)
+				if not success:
+					self._set_action_feedback(summary, False)
+					return
+				self._append_runtime_action_log(
+					actor_code=self._get_piece_short_code(caster),
+					action_label=f"法术:{spell_name}",
+					summary=summary,
+					targets=target_codes,
+					damage_by_target=damage_by_target,
+				)
+				self._try_trigger_runtime_trap_on_piece(env, caster, reason="位移完成触发")
+				self._set_action_feedback("行动成功", True)
+				self._update_cards_from_env()
+				self._refresh_piece_cards()
+				self._refresh_board_view()
+				return
+
+			if is_trap_spell:
+				success, summary, target_codes, damage_by_target = self._place_runtime_trap_spell(env, caster, spell, spell_cost)
+				if not success:
+					self._set_action_feedback(summary, False)
+					return
+				self._append_runtime_action_log(
+					actor_code=self._get_piece_short_code(caster),
+					action_label=f"法术:{spell_name}",
+					summary=summary,
+					targets=target_codes,
+					damage_by_target=damage_by_target,
+				)
+				self._set_action_feedback("行动成功", True)
+				self._update_cards_from_env()
+				self._refresh_piece_cards()
+				self._refresh_board_view()
+				return
+
+			if is_locking_spell:
+				target_text = self.action_spell_target_var.get().strip()
+				target_piece = self._resolve_spell_target_piece(target_text, spell, caster)
+				if target_piece is None:
+					self._set_action_feedback("行动失败：法术目标无效", False)
+					return
+				target_pos = getattr(target_piece, "position", None)
+				tx = int(getattr(target_pos, "x", -1)) if target_pos is not None else -1
+				ty = int(getattr(target_pos, "y", -1)) if target_pos is not None else -1
+				distance = ((caster_x - tx) ** 2 + (caster_y - ty) ** 2) ** 0.5
+				if distance > spell_range:
+					self._set_action_feedback("行动失败：目标超出施法范围", False)
+					return
+				target_area = Area(tx, ty, 0)
+				target_codes = [self._get_piece_short_code(target_piece)]
+				target_pieces = [target_piece]
+				before_hp[id(target_piece)] = int(getattr(target_piece, "health", 0))
+			else:
+				try:
+					tx = int(self.action_spell_point_x_var.get().strip())
+					ty = int(self.action_spell_point_y_var.get().strip())
+				except Exception:
+					self._set_action_feedback("行动失败：请输入合法施法坐标", False)
+					return
+				board = getattr(env, "board", None)
+				width = int(getattr(board, "width", 0)) if board is not None else 0
+				height = int(getattr(board, "height", 0)) if board is not None else 0
+				if not (0 <= tx < width and 0 <= ty < height):
+					self._set_action_feedback("行动失败：施法坐标越界", False)
+					return
+				distance = ((caster_x - tx) ** 2 + (caster_y - ty) ** 2) ** 0.5
+				if distance > spell_range:
+					self._set_action_feedback("行动失败：施法点超出施法范围", False)
+					return
+				target_area = Area(tx, ty, max(0, area_radius))
+				area_targets = self._collect_area_spell_targets(env, caster, spell, target_area)
+				target_codes = [self._get_piece_short_code(p) for p in area_targets]
+				target_pieces = list(area_targets)
+				for p in area_targets:
+					before_hp[id(p)] = int(getattr(p, "health", 0))
+
+			spell_context = SpellContext()
+			spell_context.caster = caster
+			spell_context.target = target_piece
+			spell_context.spell = spell
+			spell_context.target_area = target_area
+			spell_context.is_delay_spell = bool(getattr(spell, "is_delay_spell", False))
+			spell_context.delay_add = False
+			spell_context.spell_cost = spell_cost
+			spell_context.spell_lifespan = int(getattr(spell, "base_lifespan", 0))
+
+			action = ActionSet()
+			action.move = False
+			action.attack = False
+			action.spell = True
+			action.spell_context = spell_context
+
+			setattr(env, "current_piece", caster)
+			env.execute_player_action(action)
+
+			new_ap = int(getattr(caster, "action_points", 0))
+			new_sp = int(getattr(caster, "spell_slots", 0))
+			damage_by_target: dict[str, int] = {}
+			for code in target_codes:
+				piece = None
+				for p in self._coerce_piece_list(getattr(env, "action_queue", [])):
+					if self._get_piece_short_code(p) == code:
+						piece = p
+						break
+				if piece is None:
+					continue
+				old_hp = before_hp.get(id(piece), int(getattr(piece, "health", 0)))
+				new_hp = int(getattr(piece, "health", 0))
+				delta = max(0, old_hp - new_hp)
+				if delta > 0:
+					damage_by_target[code] = delta
+
+			if new_ap == old_ap and new_sp == old_sp:
+				self._set_action_feedback("行动失败：法术未生效（目标/范围/资源不满足）", False)
+				return
+
+			self.right_info_panel.append_content(
+				f"\n[公式] 资源消耗：AP {old_ap}->{new_ap}，SP {old_sp}->{new_sp}"
+			)
+			for p in target_pieces:
+				if p is None:
+					continue
+				code = self._get_piece_short_code(p)
+				old_hp = before_hp.get(id(p), int(getattr(p, "health", 0)))
+				new_hp = int(getattr(p, "health", 0))
+				delta = int(old_hp - new_hp)
+				if delta > 0:
+					self.right_info_panel.append_content(
+						f"\n[公式] 结算：{spell_name} 对 {code} 造成 {delta} 点伤害（HP {old_hp}->{new_hp}）"
+					)
+				elif delta < 0:
+					heal = -delta
+					self.right_info_panel.append_content(
+						f"\n[公式] 结算：{spell_name} 为 {code} 恢复 {heal} 点生命（HP {old_hp}->{new_hp}）"
+					)
+				if new_hp <= 0:
+					self._handle_death_check_if_possible(env, p)
+
+			summary_targets = ",".join(target_codes) if target_codes else "无"
+			summary = f"目标[{summary_targets}]，AP {old_ap}->{new_ap}，SP {old_sp}->{new_sp}"
+			self._append_runtime_action_log(
+				actor_code=self._get_piece_short_code(caster),
+				action_label=f"法术:{spell_name}",
+				summary=summary,
+				targets=target_codes,
+				damage_by_target=damage_by_target,
+			)
+			for p in target_pieces:
+				if p is None:
+					continue
+				self._append_runtime_death_and_game_over_info(p, self._get_piece_short_code(p))
+
+			# 清理施法点坐标与 AOE 预览，避免火球术等范围可视化残留。
+			if not bool(getattr(spell, "is_locking_spell", False)):
+				try:
+					self.action_spell_point_x_var.set("")
+					self.action_spell_point_y_var.set("")
+				except Exception:
+					pass
+				try:
+					self.left_board_panel.set_spell_aoe_overlay([], "#f97316")
+				except Exception:
+					pass
+			self._set_action_feedback("行动成功", True)
+			self._update_cards_from_env()
+			self._refresh_piece_cards()
+			self._refresh_board_view()
+			return
 
 		self.right_info_panel.append_content(f"\n{message}")
 		self.right_info_panel.append_content("\n[UI] 当前模式尚为预览，后续会接入规则校验与真实执行")
 
 	def _on_finish_current_piece_turn(self) -> None:
 		"""结束当前棋子行动时段：若未提交动作，则按空行动推进到下一棋子。"""
+		self._stop_action_move_point_pick()
 		if self.controller.runtime_source != "runtime_env" or self.controller.environment is None:
 			self.right_info_panel.append_content("\n[UI] 仅 runtime 模式支持“行动完毕”")
 			return
@@ -2096,6 +3354,7 @@ class MainUI:
 		curr_id = int(getattr(piece, "id", -1))
 		if curr_id >= 0:
 			self.runtime_cycle_done_piece_ids.add(curr_id)
+		ended_piece = piece
 
 		alive_queue = [p for p in self._coerce_piece_list(getattr(env, "action_queue", [])) if bool(getattr(p, "is_alive", True))]
 		if not alive_queue:
@@ -2111,13 +3370,21 @@ class MainUI:
 		setattr(env, "current_piece", rotated[0] if rotated else None)
 
 		alive_ids = {int(getattr(p, "id", -1)) for p in rotated if int(getattr(p, "id", -1)) >= 0}
+		round_advanced = False
 		if alive_ids and self.runtime_cycle_done_piece_ids.issuperset(alive_ids):
 			for p in rotated:
 				if bool(getattr(p, "is_alive", True)):
 					p.set_action_points(int(getattr(p, "max_action_points", getattr(p, "action_points", 0))))
 			self.runtime_cycle_done_piece_ids.clear()
 			setattr(env, "round_number", int(getattr(env, "round_number", 0)) + 1)
+			round_advanced = True
 			self.right_info_panel.append_content("\n[UI] 新一轮开始：已重置全部存活棋子的行动位")
+
+		# 行动时段结束后：若结束行动的棋子站在陷阱上，且此刻不再是当前行动，则触发并消失。
+		if ended_piece is not getattr(env, "current_piece", None):
+			self._try_trigger_runtime_trap_on_piece(env, ended_piece, reason="行动完毕触发")
+
+		self._tick_runtime_traps(env, round_advanced=round_advanced)
 
 		self._append_runtime_turn_round_status()
 
@@ -2409,6 +3676,45 @@ class MainUI:
 		self._center_popup_window(window)
 		if not modal:
 			window.lift()
+
+	def _show_game_over_reset_dialog(self) -> None:
+		"""游戏结束后弹窗确认：是否重置游戏。"""
+		if self.game_over_dialog_shown:
+			return
+		self.game_over_dialog_shown = True
+
+		window = tk.Toplevel(self.root)
+		window.title("游戏结束")
+		window.transient(self.root)
+		window.resizable(False, False)
+		window.grab_set()
+
+		frame = ttk.Frame(window, padding=12)
+		frame.pack(fill="both", expand=True)
+		ttk.Label(frame, text="是否重置游戏？", justify="left").pack(anchor="w")
+
+		button_row = ttk.Frame(frame)
+		button_row.pack(fill="x", pady=(10, 0))
+
+		def _show_no_warning() -> None:
+			self._show_notice_popup(
+				"提示",
+				"目前在开发阶段，不重置可能存在bug，如想正常重开一局，请点击\"模式选择\"",
+			)
+
+		def on_yes() -> None:
+			window.destroy()
+			self._on_click_reset()
+
+		def on_no_like_close() -> None:
+			window.destroy()
+			_show_no_warning()
+
+		ttk.Button(button_row, text="否", command=on_no_like_close).pack(side="right")
+		ttk.Button(button_row, text="是", command=on_yes).pack(side="right", padx=(0, 6))
+
+		window.protocol("WM_DELETE_WINDOW", on_no_like_close)
+		self._center_popup_window(window)
 
 	def _show_initiative_summary_popup(self) -> None:
 		"""显示开局先攻详情：属性值、随机值、总值、序号与最终顺序。"""
@@ -2852,15 +4158,89 @@ class MainUI:
 		env = self.controller.environment
 		if env is None:
 			return result
+		if self.runtime_piece_init_config and not self.runtime_piece_slot_binding:
+			self._capture_runtime_piece_slot_binding_from_init_config()
+
 		for team_id, player_attr in ((1, "player1"), (2, "player2")):
 			player = getattr(env, player_attr, None)
 			pieces = self._coerce_piece_list(getattr(player, "pieces", None) if player is not None else None)
 			if not pieces:
 				continue
 			sorted_pieces = sorted(pieces, key=lambda p: int(getattr(p, "id", 0)))
-			for idx, piece in enumerate(sorted_pieces[:3], start=1):
-				result[f"p{team_id}_{idx}"] = piece
+			used_slots: set[str] = set()
+
+			for piece in sorted_pieces:
+				slot_key = self.runtime_piece_slot_binding.get(id(piece), "")
+				if not slot_key.startswith(f"p{team_id}_"):
+					continue
+				if slot_key in used_slots:
+					continue
+				result[slot_key] = piece
+				used_slots.add(slot_key)
+
+			fallback_slots = [f"p{team_id}_{idx}" for idx in (1, 2, 3) if f"p{team_id}_{idx}" not in used_slots]
+			fallback_idx = 0
+			for piece in sorted_pieces:
+				bound_slot = self.runtime_piece_slot_binding.get(id(piece), "")
+				if bound_slot in used_slots:
+					continue
+				if fallback_idx >= len(fallback_slots):
+					break
+				slot_key = fallback_slots[fallback_idx]
+				fallback_idx += 1
+				result[slot_key] = piece
+				used_slots.add(slot_key)
 		return result
+
+	def _capture_runtime_piece_slot_binding_from_init_config(self) -> None:
+		"""按初始化配置建立棋子与槽位的一次性绑定，避免非连续槽位被重排。"""
+		env = self.controller.environment
+		if env is None:
+			return
+
+		new_binding: dict[int, str] = {}
+		for team_id, player_attr in ((1, "player1"), (2, "player2")):
+			player = getattr(env, player_attr, None)
+			pieces = self._coerce_piece_list(getattr(player, "pieces", None) if player is not None else None)
+			if not pieces:
+				continue
+
+			expected_slots: list[tuple[str, int, int]] = []
+			for idx in (1, 2, 3):
+				slot_key = f"p{team_id}_{idx}"
+				cfg = self.runtime_piece_init_config.get(slot_key, {})
+				hp_raw = str(cfg.get("hp", "-")).strip()
+				if hp_raw in ("", "-", "-1") or self._safe_int(hp_raw, -1) <= 0:
+					continue
+				x = self._safe_int(str(cfg.get("pos_x", 0)), 0)
+				y = self._safe_int(str(cfg.get("pos_y", 0)), 0)
+				expected_slots.append((slot_key, x, y))
+
+			remaining_pieces = list(pieces)
+			used_slots: set[str] = set()
+
+			for slot_key, x, y in expected_slots:
+				matched_piece = next(
+					(
+						piece
+						for piece in remaining_pieces
+						if int(getattr(getattr(piece, "position", None), "x", -9999)) == x
+						and int(getattr(getattr(piece, "position", None), "y", -9999)) == y
+					),
+					None,
+				)
+				if matched_piece is None:
+					continue
+				new_binding[id(matched_piece)] = slot_key
+				used_slots.add(slot_key)
+				remaining_pieces.remove(matched_piece)
+
+			remaining_slots = [slot for slot, _x, _y in expected_slots if slot not in used_slots]
+			remaining_pieces.sort(key=lambda p: int(getattr(p, "id", 0)))
+			for slot_key, piece in zip(remaining_slots, remaining_pieces):
+				new_binding[id(piece)] = slot_key
+
+		self.runtime_piece_slot_binding = new_binding
 
 	def _mock_piece_slot_map(self) -> dict[str, int]:
 		result: dict[str, int] = {}
@@ -2879,14 +4259,14 @@ class MainUI:
 				"strength": "10",
 				"dexterity": "10",
 				"intelligence": "10",
-				"physical_resist": "0",
-				"magic_resist": "0",
-				"physical_damage": "0",
-				"magic_damage": "0",
-				"action_points": "1",
-				"max_action_points": "1",
-				"spell_slots": "1",
-				"max_spell_slots": "1",
+				"physical_resist": "6",
+				"magic_resist": "6",
+				"physical_damage": "6",
+				"magic_damage": "6",
+				"action_points": "2",
+				"max_action_points": "2",
+				"spell_slots": "2",
+				"max_spell_slots": "2",
 				"movement": "10",
 				"pos_x": "0",
 				"pos_y": "0",
@@ -3057,8 +4437,10 @@ class MainUI:
 					return False
 			except Exception:
 				return False
+			# 注：部分地图/实现可能会使用 state=0 表示“空地”，但仍可作为落点。
+			# 这里对属性编辑放宽：只要不是禁止格(state=-1)且高度不为-1即可。
 			cell = board.grid[x][y]
-			return int(getattr(cell, "state", 0)) in (1, 2)
+			return int(getattr(cell, "state", 0)) != -1
 
 		game_data = self.controller.game_data
 		if not isinstance(game_data, dict):
@@ -3202,7 +4584,7 @@ class MainUI:
 		finally:
 			self.attribute_internal_update = False
 
-		# 构建“有效棋子”集合，并检查坐标合法性（不可重叠、不可走、阵营半场）。
+		# 构建“有效棋子”集合，并检查坐标合法性（不可重叠、不可走）。
 		invalid_coordinate_slots: list[tuple[str, str]] = []
 		position_to_slots: dict[str, list[str]] = {}
 		for slot_key in self._piece_slot_keys():
@@ -3230,15 +4612,6 @@ class MainUI:
 				invalid_coordinate_slots.append((slot_key, "walkable"))
 				continue
 
-			border = self._runtime_border_line() if self.selected_source == "runtime" else -1
-			if self.selected_source == "runtime":
-				if team == 1 and y >= border:
-					invalid_coordinate_slots.append((slot_key, "border"))
-					continue
-				if team == 2 and y <= border:
-					invalid_coordinate_slots.append((slot_key, "border"))
-					continue
-
 			pos_key = f"{x},{y}"
 			position_to_slots.setdefault(pos_key, []).append(slot_key)
 			planned_positions[pos_key] = (x, y)
@@ -3255,7 +4628,7 @@ class MainUI:
 			for slot_key, _reason in invalid_coordinate_slots:
 				self._mark_attribute_field_error(slot_key, "pos_x")
 				self._mark_attribute_field_error(slot_key, "pos_y")
-			self._show_attribute_warning_feedback("存在非法坐标（重合/越界/不可走/半场错误），请修改红色坐标")
+			self._show_attribute_warning_feedback("存在非法坐标（重合/越界/不可走），请修改红色坐标")
 			return
 
 		# 后端强制初始化：必须双方至少各有一个有效棋子。
@@ -3609,6 +4982,7 @@ class MainUI:
 			self.right_info_panel.append_content(f"\n[UI] 单步执行失败: {e}")
 
 	def _on_click_reset(self) -> None:
+		self._close_replay_mode_ui()
 		self._on_click_pause()
 		try:
 			if self.controller.runtime_source == "runtime_env":
@@ -3621,6 +4995,18 @@ class MainUI:
 			self.mock_last_health_by_id = {}
 			self.mock_last_positions_by_id = {}
 			self.mock_piece_number_by_id = {}
+			self.runtime_piece_slot_binding = {}
+			self.runtime_trap_effects = []
+			# 重置行动选择状态，避免重开后棋盘仍残留目标高亮/施法点。
+			self.action_ui_mode.set("move")
+			self.action_move_x_var.set("")
+			self.action_move_y_var.set("")
+			self.action_spell_type_var.set("")
+			self.action_spell_target_var.set("")
+			self.action_spell_point_x_var.set("")
+			self.action_spell_point_y_var.set("")
+			self.action_spell_option_map = {}
+			self.action_spell_target_option_map = {}
 			self.left_board_panel.reset_board_state()
 			self._refresh_piece_cards()
 			choice = self._show_source_selection_dialog("重置后：选择数据源")
@@ -3631,11 +5017,13 @@ class MainUI:
 				if selected is not None:
 					self.selected_mock_dataset = selected
 			self.right_info_panel.append_content("\n[UI] 重置完成，正在按选择加载数据")
-			self._on_click_load_data()
+			# 这里已完成 source/dataset 选择，直接加载，避免再次弹出“模式选择”弹窗。
+			self._load_data_with_selected_source()
 		except Exception as e:
 			self.right_info_panel.append_content(f"\n[UI] 重置失败: {e}")
 
 	def _on_event_game_loaded(self, event) -> None:
+		self.runtime_trap_effects = []
 		self.right_info_panel.append_content(
 			f"\n[EVENT] GAME_LOADED source={event.payload.get('source')} mode={event.payload.get('mode')}"
 		)
@@ -3651,7 +5039,13 @@ class MainUI:
 		)
 
 	def _on_event_game_over(self, _event) -> None:
-		self.right_info_panel.append_content("\n[EVENT] GAME_OVER")
+		env = self.controller.environment
+		winner = "未知"
+		if env is not None:
+			p1_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player1", None), "pieces", [])))
+			p2_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player2", None), "pieces", [])))
+			winner = "玩家1" if p1_alive else ("玩家2" if p2_alive else "无人")
+		self.right_info_panel.append_content(f"\nGAME_OVER，胜者：{winner}")
 
 	def _on_click_initialize(self) -> None:
 		"""退出测试。
