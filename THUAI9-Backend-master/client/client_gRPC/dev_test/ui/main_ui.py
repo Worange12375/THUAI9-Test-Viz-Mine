@@ -99,7 +99,7 @@ class MainUI:
 		self.replay_round_var = tk.IntVar(value=0)
 		self.replay_controls_visible = False
 		self.replay_play_pause_button: ttk.Button | None = None
-		self.selected_source = "runtime"
+		self.selected_source = "runtime_custom"
 		self.selected_mock_dataset: Optional[str] = None
 		self.mock_initial_positions: dict[int, dict[str, Any]] = {}
 		self.mock_piece_stats_by_id: dict[int, dict[str, Any]] = {}
@@ -182,6 +182,335 @@ class MainUI:
 		self._build_right_side(right_frame)
 		self.root.after(100, self._startup_load_with_source_dialog)
 
+	def _normalize_selected_source_value(self, value: str) -> str:
+		"""兼容旧值：将 runtime 归一到 runtime_custom。"""
+		value_norm = str(value or "").strip().lower()
+		if value_norm == "runtime":
+			return "runtime_custom"
+		if value_norm in ("runtime_custom", "runtime_profession", "mock"):
+			return value_norm
+		return "runtime_custom"
+
+	def _is_runtime_selected_source(self) -> bool:
+		return self._normalize_selected_source_value(self.selected_source) in ("runtime_custom", "runtime_profession")
+
+	def _is_profession_mode(self) -> bool:
+		return self._normalize_selected_source_value(self.selected_source) == "runtime_profession"
+
+	def _weapon_label_to_weapon_id(self, weapon_label: str) -> int:
+		label = str(weapon_label or "").strip()
+		if label in ("长剑", "长"):
+			return 1
+		if label in ("短剑", "短剑🗡", "🗡", "短"):
+			return 2
+		if label == "弓":
+			return 3
+		if label == "法杖":
+			return 4
+		return 0
+
+	def _armor_label_to_armor_id(self, armor_label: str) -> int:
+		label = str(armor_label or "").strip()
+		if label == "轻甲":
+			return 1
+		if label == "中甲":
+			return 2
+		if label == "重甲":
+			return 3
+		return 0
+
+	def _weapon_id_to_weapon_label(self, weapon_id: int) -> str:
+		wid = int(weapon_id)
+		if wid == 1:
+			return "长剑"
+		if wid == 2:
+			return "短剑"
+		if wid == 3:
+			return "弓"
+		if wid == 4:
+			return "法杖"
+		return "自定义"
+
+	def _armor_id_to_armor_label(self, armor_id: int) -> str:
+		aid = int(armor_id)
+		if aid == 1:
+			return "轻甲"
+		if aid == 2:
+			return "中甲"
+		if aid == 3:
+			return "重甲"
+		return "无甲"
+
+	def _normalize_weapon_label(self, weapon_label: str) -> str:
+		label = str(weapon_label or "").strip()
+		if label == "长枪":
+			return "长剑"
+		if label == "短剑🗡":
+			return "短剑"
+		if label == "🗡":
+			return "短剑"
+		return label
+
+	def _weapon_id_to_profession_display(self, weapon_id: int) -> str:
+		wid = int(weapon_id)
+		if wid == 1:
+			return "战士(长)"
+		if wid == 2:
+			return "战士(短)"
+		if wid == 3:
+			return "射手"
+		if wid == 4:
+			return "法师"
+		return "自定义"
+
+	def _weapon_id_to_profession_label_simple(self, weapon_id: int) -> str:
+		wid = int(weapon_id)
+		if wid in (1, 2):
+			return "战士"
+		if wid == 3:
+			return "射手"
+		if wid == 4:
+			return "法师"
+		return "自定义"
+
+	def _compute_equipment_only_stats(
+		self,
+		*,
+		weapon_id: int,
+		armor_id: int,
+		strength: int | None = None,
+		dexterity: int | None = None,
+	) -> dict[str, str]:
+		"""仅按武器/护甲更新对应数值，用于自定义模式。
+		- 物伤/法伤/物抗/法抗：完全由装备决定
+		- 移动力：若提供 strength/dexterity，则按后端公式 base + 护甲修正计算；否则不返回 movement
+		"""
+		physical_damage, magic_damage = 6, 6
+		if int(weapon_id) == 1:
+			physical_damage, magic_damage = 18, 0
+		elif int(weapon_id) == 2:
+			physical_damage, magic_damage = 24, 0
+		elif int(weapon_id) == 3:
+			physical_damage, magic_damage = 16, 0
+		elif int(weapon_id) == 4:
+			physical_damage, magic_damage = 0, 22
+
+		physical_resist, magic_resist = 6, 6
+		if int(armor_id) == 1:
+			physical_resist, magic_resist = 8, 10
+		elif int(armor_id) == 2:
+			physical_resist, magic_resist = 15, 13
+		elif int(armor_id) == 3:
+			physical_resist, magic_resist = 23, 17
+
+		result = {
+			"physical_damage": str(int(physical_damage)),
+			"magic_damage": str(int(magic_damage)),
+			"physical_resist": str(int(physical_resist)),
+			"magic_resist": str(int(magic_resist)),
+		}
+		if strength is not None and dexterity is not None:
+			move_delta = 0.0
+			if int(armor_id) == 1:
+				move_delta = 3.0
+			elif int(armor_id) == 3:
+				move_delta = -3.0
+			base_move = float(dexterity) + 0.5 * float(strength) + 10.0
+			movement = max(0.0, base_move + move_delta)
+			result["movement"] = f"{float(movement):.1f}".rstrip("0").rstrip(".")
+		return result
+
+	def _update_custom_mode_equipment_presets(self, slot_key: str, *, update_stats: bool) -> None:
+		"""自定义模式：职业随武器变化且只读显示。
+		- update_stats=True: 覆盖更新装备对应的附带属性值（物伤/法伤/物抗/法抗），但不锁死字段。
+		- update_stats=False: 仅刷新职业显示，不改数值（避免打开窗口时覆盖玩家手调值）。
+		"""
+		if self._is_profession_mode():
+			return
+		vars_dict = self.attribute_piece_vars.get(slot_key)
+		if not vars_dict:
+			return
+		weapon_label = self._normalize_weapon_label(str(vars_dict.get("weapon").get()).strip()) if vars_dict.get("weapon") else "自定义"
+		armor_label = str(vars_dict.get("armor").get()).strip() if vars_dict.get("armor") else "无甲"
+		weapon_id = self._weapon_label_to_weapon_id(weapon_label)
+		armor_id = self._armor_label_to_armor_id(armor_label)
+
+		profession_var = vars_dict.get("profession")
+		if profession_var is not None:
+			desired = self._weapon_id_to_profession_label_simple(weapon_id)
+			if str(profession_var.get()).strip() != desired:
+				self.attribute_internal_update = True
+				try:
+					profession_var.set(desired)
+				finally:
+					self.attribute_internal_update = False
+
+		if update_stats:
+			strength = self._safe_int(str(vars_dict.get("strength").get()).strip(), 10) if vars_dict.get("strength") else 10
+			dexterity = self._safe_int(str(vars_dict.get("dexterity").get()).strip(), 10) if vars_dict.get("dexterity") else 10
+			presets = self._compute_equipment_only_stats(
+				weapon_id=weapon_id,
+				armor_id=armor_id,
+				strength=strength,
+				dexterity=dexterity,
+			)
+			self.attribute_internal_update = True
+			try:
+				for key, value in presets.items():
+					var = vars_dict.get(key)
+					if var is not None:
+						var.set(str(value))
+			finally:
+				self.attribute_internal_update = False
+
+	def _update_equipment_dependent_fields(self, slot_key: str) -> None:
+		if self._is_profession_mode():
+			self._update_profession_display_and_presets(slot_key)
+		else:
+			self._update_custom_mode_equipment_presets(slot_key, update_stats=False)
+
+	def _weapon_id_to_piece_type(self, weapon_id: int) -> str:
+		wid = int(weapon_id)
+		if wid in (1, 2):
+			return "Warrior"
+		if wid == 3:
+			return "Archer"
+		if wid == 4:
+			return "Mage"
+		return "Custom"
+
+	def _compute_profession_mode_stats(
+		self,
+		*,
+		strength: int,
+		dexterity: int,
+		intelligence: int,
+		weapon_id: int,
+		armor_id: int,
+	) -> dict[str, str]:
+		"""按 env.py 的 local_init / set_weapon / set_armor 计算派生属性（字符串形式用于回填 UI）。"""
+		max_health = 30 + int(strength) * 2
+		if int(strength) <= 13:
+			max_action = 1
+		elif int(strength) <= 21:
+			max_action = 2
+		else:
+			max_action = 3
+
+		int_val = int(intelligence)
+		if int_val <= 3:
+			max_spell = 1
+		elif int_val <= 7:
+			max_spell = 2
+		elif int_val <= 12:
+			max_spell = 3
+		elif int_val <= 16:
+			max_spell = 5
+		elif int_val <= 21:
+			max_spell = 8
+		else:
+			max_spell = 9
+
+		base_move = float(dexterity) + 0.5 * float(strength) + 10.0
+		phys_resist, magic_resist, move_delta = 0, 0, 0.0
+		if int(armor_id) == 1:
+			phys_resist, magic_resist, move_delta = 8, 10, 3.0
+		elif int(armor_id) == 2:
+			phys_resist, magic_resist, move_delta = 15, 13, 0.0
+		elif int(armor_id) == 3:
+			phys_resist, magic_resist, move_delta = 23, 17, -3.0
+		movement = max(0.0, base_move + move_delta)
+
+		physical_damage, magic_damage = 0, 0
+		if int(weapon_id) == 1:
+			physical_damage, magic_damage = 18, 0
+		elif int(weapon_id) == 2:
+			physical_damage, magic_damage = 24, 0
+		elif int(weapon_id) == 3:
+			physical_damage, magic_damage = 16, 0
+		elif int(weapon_id) == 4:
+			physical_damage, magic_damage = 0, 22
+
+		return {
+			"hp": str(int(max_health)),
+			"physical_resist": str(int(phys_resist)),
+			"magic_resist": str(int(magic_resist)),
+			"physical_damage": str(int(physical_damage)),
+			"magic_damage": str(int(magic_damage)),
+			"max_action_points": str(int(max_action)),
+			"action_points": str(int(max_action)),
+			"max_spell_slots": str(int(max_spell)),
+			"spell_slots": str(int(max_spell)),
+			"movement": f"{float(movement):.1f}".rstrip("0").rstrip("."),
+		}
+
+	def _update_profession_display_and_presets(self, slot_key: str) -> None:
+		vars_dict = self.attribute_piece_vars.get(slot_key)
+		if not vars_dict:
+			return
+		weapon_label = str(vars_dict.get("weapon").get()).strip() if vars_dict.get("weapon") else ""
+		armor_label = str(vars_dict.get("armor").get()).strip() if vars_dict.get("armor") else ""
+		weapon_id = self._weapon_label_to_weapon_id(weapon_label)
+		armor_id = self._armor_label_to_armor_id(armor_label)
+
+		# 仅职业模式：职业由武器决定；自定义模式下职业可自由编辑。
+		if self._is_profession_mode():
+			profession_var = vars_dict.get("profession")
+			if profession_var is not None:
+				profession_display = self._weapon_id_to_profession_display(weapon_id)
+				if profession_var.get() != profession_display:
+					self.attribute_internal_update = True
+					try:
+						profession_var.set(profession_display)
+					finally:
+						self.attribute_internal_update = False
+
+		# 仅职业模式：法杖强制轻甲（与 env.py 规则对齐）。
+		if self._is_profession_mode() and weapon_id == 4 and vars_dict.get("armor") is not None:
+			if str(vars_dict["armor"].get()).strip() != "轻甲":
+				self.attribute_internal_update = True
+				try:
+					vars_dict["armor"].set("轻甲")
+				finally:
+					self.attribute_internal_update = False
+			armor_id = 1
+
+		# 仅职业模式且在初始化配置阶段：自动填充派生属性（未点击“应用”前也生效）。
+		if not (self._is_profession_mode() and self.attribute_settings_force_init_mode):
+			return
+		strength = self._safe_int(vars_dict.get("strength").get(), 10) if vars_dict.get("strength") else 10
+		dexterity = self._safe_int(vars_dict.get("dexterity").get(), 10) if vars_dict.get("dexterity") else 10
+		intelligence = self._safe_int(vars_dict.get("intelligence").get(), 10) if vars_dict.get("intelligence") else 10
+		if armor_id <= 0 and weapon_id in (1, 2, 3, 4):
+			armor_id = 1
+		derived = self._compute_profession_mode_stats(
+			strength=strength,
+			dexterity=dexterity,
+			intelligence=intelligence,
+			weapon_id=weapon_id,
+			armor_id=armor_id,
+		)
+		self.attribute_internal_update = True
+		try:
+			for key, value in derived.items():
+				if key == "hp":
+					continue
+				var = vars_dict.get(key)
+				if var is not None:
+					var.set(str(value))
+		finally:
+			self.attribute_internal_update = False
+
+	def _sync_profession_equipment(self, slot_key: str, changed_field: str) -> None:
+		"""将职业展示与属性联动到武器/护甲。职业模式=派生锁定；自定义模式=仅覆盖装备相关数值但不锁死。"""
+		if changed_field not in ("weapon", "armor"):
+			return
+		if self._is_profession_mode():
+			self._update_profession_display_and_presets(slot_key)
+		else:
+			# 自定义模式：只有在武器/护甲变更时才覆盖数值。
+			self._update_custom_mode_equipment_presets(slot_key, update_stats=True)
+
 	def _show_source_selection_dialog(self, title: str = "选择数据源") -> Optional[str]:
 		"""弹窗选择数据源：后端玩法环境或 mock 回放。"""
 		choice = {"value": None}
@@ -196,16 +525,17 @@ class MainUI:
 		frame.pack(fill="both", expand=True)
 
 		ttk.Label(frame, text="请选择本次测试的数据源：").pack(anchor="w", pady=(0, 8))
-		var = tk.StringVar(value=self.selected_source)
+		var = tk.StringVar(value=self._normalize_selected_source_value(self.selected_source))
 
-		ttk.Radiobutton(frame, text="后端玩法环境（推荐）", value="runtime", variable=var).pack(anchor="w")
-		ttk.Radiobutton(frame, text="mock 回放数据", value="mock", variable=var).pack(anchor="w", pady=(0, 8))
+		ttk.Radiobutton(frame, text="手动对局模式（自定义）", value="runtime_custom", variable=var).pack(anchor="w")
+		ttk.Radiobutton(frame, text="手动对局模式（职业）", value="runtime_profession", variable=var).pack(anchor="w")
+		ttk.Radiobutton(frame, text="mock数据模式", value="mock", variable=var).pack(anchor="w", pady=(0, 8))
 
 		button_row = ttk.Frame(frame)
 		button_row.pack(fill="x", pady=(8, 0))
 
 		def on_ok() -> None:
-			choice["value"] = var.get()
+			choice["value"] = self._normalize_selected_source_value(var.get())
 			window.destroy()
 
 		def on_cancel() -> None:
@@ -290,7 +620,7 @@ class MainUI:
 		choice = self._show_source_selection_dialog("进入测试：选择数据源")
 		if choice is None:
 			self.right_info_panel.append_content("\n[UI] 未选择数据源，默认使用后端玩法环境")
-			self.selected_source = "runtime"
+			self.selected_source = "runtime_custom"
 		else:
 			self.selected_source = choice
 		if self.selected_source == "mock":
@@ -327,7 +657,7 @@ class MainUI:
 		self.game_over_dialog_shown = False
 		try:
 			self.controller.select_mode("manual")
-			if self.selected_source == "runtime":
+			if self._is_runtime_selected_source():
 				self.mock_map_height_overrides = {}
 				self.controller.load_game_data(prefer_runtime=True)
 				self._attach_runtime_input()
@@ -350,6 +680,7 @@ class MainUI:
 					self._set_runtime_board_all_walkable()
 					self._apply_runtime_piece_config_to_environment()
 					self._initialize_runtime_card_slots()
+					self._install_runtime_env_deathcheck_hook(env)
 					self._show_initiative_summary_popup()
 				self.loaded = True
 				self.left_board_panel.reset_board_state()
@@ -358,7 +689,8 @@ class MainUI:
 				self.root.update_idletasks()
 				self._refresh_board_view()
 				self._sync_replay_round_var()
-				self.right_info_panel.append_content("\n[UI] 已加载后端模式")
+				mode_desc = "后端模式（职业）" if self._is_profession_mode() else "后端模式（自定义）"
+				self.right_info_panel.append_content(f"\n[UI] 已加载{mode_desc}")
 				return
 
 			if not self.selected_mock_dataset:
@@ -379,6 +711,62 @@ class MainUI:
 			self.right_info_panel.append_content(f"\n[UI] 已加载 mock 模式: {self.selected_mock_dataset}")
 		except Exception as e:
 			self.right_info_panel.append_content(f"\n[UI] 加载失败: {e}")
+
+	def _install_runtime_env_deathcheck_hook(self, env: Any) -> None:
+		"""在不改 env.py 的前提下，为死亡检定增加 UI 可见的提示与掷骰结果。
+
+		实现方式：运行时 monkeypatch env.roll_dice 与 env.handle_death_check，
+		仅记录/展示信息，不改变任何判定分支。
+		"""
+		if env is None:
+			return
+		if bool(getattr(env, "_ui_deathcheck_hook_installed", False)):
+			return
+
+		setattr(env, "_ui_deathcheck_hook_installed", True)
+		setattr(env, "_ui_in_deathcheck", False)
+		setattr(env, "_ui_last_deathcheck_roll", None)
+
+		orig_roll_dice = getattr(env, "roll_dice", None)
+		orig_handle = getattr(env, "handle_death_check", None)
+		if not callable(orig_roll_dice) or not callable(orig_handle):
+			return
+
+		def roll_dice_hook(n: int, sides: int):
+			result = orig_roll_dice(n, sides)
+			if bool(getattr(env, "_ui_in_deathcheck", False)) and int(n) == 1 and int(sides) == 20:
+				try:
+					setattr(env, "_ui_last_deathcheck_roll", int(result))
+				except Exception:
+					setattr(env, "_ui_last_deathcheck_roll", result)
+			return result
+
+		def handle_death_check_hook(target: Any):
+			setattr(env, "_ui_in_deathcheck", True)
+			setattr(env, "_ui_last_deathcheck_roll", None)
+			try:
+				return orig_handle(target)
+			finally:
+				setattr(env, "_ui_in_deathcheck", False)
+				roll_value = getattr(env, "_ui_last_deathcheck_roll", None)
+				piece_code = self._get_piece_short_code(target)
+				if roll_value is None:
+					self.right_info_panel.append_content(f"\n[死亡检定] {piece_code} 触发死亡检定：d20=?")
+					return
+				try:
+					roll_int = int(roll_value)
+				except Exception:
+					roll_int = None
+
+				if roll_int == 20:
+					self.right_info_panel.append_content(f"\n[死亡检定] {piece_code} 掷 d20=20：恢复至 1HP")
+				else:
+					# 玩法文档存在“进入濒死”的期望，但当前 env 实现非 20 直接死亡。
+					extra = "（当前实现：非20未进入濒死，直接死亡）" if roll_int is not None else ""
+					self.right_info_panel.append_content(f"\n[死亡检定] {piece_code} 掷 d20={roll_value}{extra}")
+
+		setattr(env, "roll_dice", roll_dice_hook)
+		setattr(env, "handle_death_check", handle_death_check_hook)
 
 	def _prepare_runtime_piece_init_defaults(self) -> None:
 		"""准备后端模式初始化阶段的 6 槽位默认配置。"""
@@ -447,17 +835,23 @@ class MainUI:
 			_ = slot_key
 			for field, widget in field_widgets.items():
 				is_disabled = str(widget.cget("state")) == "disabled"
-				if is_disabled:
-					widget.configure(fg="#9ca3af")
-				else:
-					widget.configure(fg="#111111")
+				try:
+					if is_disabled:
+						widget.configure(fg="#9ca3af")
+					else:
+						widget.configure(fg="#111111")
+				except Exception:
+					pass
 				_ = field
 
 	def _mark_attribute_field_error(self, slot_key: str, field: str) -> None:
 		entry = getattr(self, "attribute_piece_entries", {}).get(slot_key, {}).get(field)
 		if entry is None:
 			return
-		entry.configure(fg="#dc2626")
+		try:
+			entry.configure(fg="#dc2626")
+		except Exception:
+			pass
 
 	def _is_attribute_slot_enabled(self, slot_key: str) -> bool:
 		entry = getattr(self, "attribute_piece_entries", {}).get(slot_key, {}).get("hp")
@@ -468,10 +862,13 @@ class MainUI:
 	def _on_attribute_var_changed(self, slot_key: str, field: str) -> None:
 		if self.attribute_internal_update:
 			return
-		if field not in ("pos_x", "pos_y"):
+		if field in ("pos_x", "pos_y"):
+			self.attribute_edit_tick_counter += 1
+			self.attribute_piece_last_edit_tick[slot_key] = self.attribute_edit_tick_counter
 			return
-		self.attribute_edit_tick_counter += 1
-		self.attribute_piece_last_edit_tick[slot_key] = self.attribute_edit_tick_counter
+		if field in ("weapon", "armor"):
+			self._sync_profession_equipment(slot_key, field)
+			return
 
 	def _apply_runtime_piece_config_to_environment(self) -> None:
 		"""将初始化配置应用到已初始化的后端环境。"""
@@ -529,6 +926,14 @@ class MainUI:
 				self._safe_int(str(cfg.get("pos_y", 0)), 0),
 			)
 
+			weapon_label = self._normalize_weapon_label(str(cfg.get("weapon", "自定义")).strip() or "自定义")
+			armor_label = str(cfg.get("armor", "无甲")).strip() or "无甲"
+			weapon_id = self._weapon_label_to_weapon_id(weapon_label)
+			armor_id = self._armor_label_to_armor_id(armor_label)
+			piece.type = self._weapon_id_to_piece_type(weapon_id)
+			setattr(piece, "weapon", int(weapon_id))
+			setattr(piece, "armor", int(armor_id))
+
 			if board is not None:
 				x = int(piece.position.x)
 				y = int(piece.position.y)
@@ -551,7 +956,19 @@ class MainUI:
 				arg.strength = self._safe_int(str(cfg.get("strength", 10)), 10)
 				arg.dexterity = self._safe_int(str(cfg.get("dexterity", 10)), 10)
 				arg.intelligence = self._safe_int(str(cfg.get("intelligence", 10)), 10)
-				arg.equip = Point(1, 1)
+				weapon_raw = cfg.get("weapon", 1)
+				weapon_id = self._safe_int(str(weapon_raw), 0)
+				if weapon_id not in (1, 2, 3, 4):
+					weapon_label = self._normalize_weapon_label(str(weapon_raw)) or "长剑"
+					weapon_id = self._weapon_label_to_weapon_id(weapon_label) or 1
+				armor_raw = cfg.get("armor", 1)
+				armor_id = self._safe_int(str(armor_raw), 0)
+				if armor_id not in (1, 2, 3):
+					armor_label = str(armor_raw or "轻甲")
+					armor_id = self._armor_label_to_armor_id(armor_label) or 1
+				if weapon_id == 4:
+					armor_id = 1
+				arg.equip = Point(int(weapon_id), int(armor_id))
 				arg.pos = Point(
 					self._safe_int(str(cfg.get("pos_x", 0)), 0),
 					self._safe_int(str(cfg.get("pos_y", 0)), 0),
@@ -1033,6 +1450,19 @@ class MainUI:
 				self._initialize_runtime_card_slots()
 
 			current_piece = self._get_runtime_current_piece(self.controller.environment)
+
+			def _role_display(piece_obj: Any) -> str:
+				role_norm = str(getattr(piece_obj, "type", "") or "").strip().lower()
+				weapon_id = self._safe_int(str(getattr(piece_obj, "weapon", 0)), 0)
+				if role_norm == "warrior":
+					return "战士(短)" if weapon_id == 2 else "战士(长)"
+				if role_norm == "mage":
+					return "法师"
+				if role_norm == "archer":
+					return "射手"
+				if role_norm == "custom":
+					return "自定义"
+				return str(getattr(piece_obj, "type", "") or "").strip()
 			for idx, card in enumerate(self.piece_cards):
 				slot = self.runtime_card_slots[idx] if idx < len(self.runtime_card_slots) else None
 				if slot is None:
@@ -1059,7 +1489,8 @@ class MainUI:
 
 				team = int(slot.get("team", 1))
 				piece_no = int(slot.get("piece_no", idx + 1))
-				header_text = str(slot.get("slot_code", self._slot_code(team, piece_no)))
+				slot_code = str(slot.get("slot_code", self._slot_code(team, piece_no)))
+				header_text = slot_code
 				piece = slot.get("piece")
 
 				if piece is None:
@@ -1085,6 +1516,12 @@ class MainUI:
 					continue
 
 				alive = bool(getattr(piece, "is_alive", True))
+				role_text = _role_display(piece)
+				dy = bool(getattr(piece, "is_dying", False))
+				if role_text:
+					header_text = f"{slot_code} {role_text}"
+				if dy:
+					header_text = f"{header_text} [濒死]"
 				hp_cur = int(getattr(piece, "health", 0)) if alive else 0
 				hp_max = int(getattr(piece, "max_health", hp_cur))
 				spell_cur = int(getattr(piece, "spell_slots", 0))
@@ -1114,6 +1551,7 @@ class MainUI:
 					strength=str(int(getattr(piece, "strength", 0))),
 					is_selected=is_selected,
 					header_text=header_text,
+					is_dying=dy,
 					is_inactive=not alive,
 				)
 			return
@@ -1277,6 +1715,19 @@ class MainUI:
 		current_piece = self._get_runtime_current_piece(env)
 		current_id = int(getattr(current_piece, "id", -1)) if current_piece is not None else -1
 
+		def _role_short(role_text: str) -> str:
+			role_norm = str(role_text or "").strip().lower()
+			if role_norm == "warrior":
+				weapon_id = self._safe_int(str(getattr(piece, "weapon", 0)), 0)
+				return "🗡" if weapon_id == 2 else "⚔️"
+			if role_norm == "mage":
+				return "🪄"
+			if role_norm == "archer":
+				return "🏹"
+			if role_norm in ("custom", "自定义"):
+				return "📝"
+			return str(role_text or "")[:1].upper() if role_text else ""
+
 		team_pieces: dict[int, list[Any]] = {1: [], 2: []}
 		for team_id, player_attr in ((1, "player1"), (2, "player2")):
 			player = getattr(env, player_attr, None)
@@ -1295,12 +1746,18 @@ class MainUI:
 				pos = getattr(piece, "position", None)
 				x = int(getattr(pos, "x", -1)) if pos is not None else -1
 				y = int(getattr(pos, "y", -1)) if pos is not None else -1
+				base_label = self._get_piece_short_code(piece)
+				role = str(getattr(piece, "type", "") or "").strip()
+				dy = bool(getattr(piece, "is_dying", False))
+				role_tag = _role_short(role)
+				if role_tag or dy:
+					base_label = f"{base_label}\n{role_tag}{'!' if dy else ''}".rstrip()
 				render_pieces.append(
 					{
 						"team": team_id,
 						"x": x,
 						"y": y,
-						"label": self._get_piece_short_code(piece),
+						"label": base_label,
 						"is_current": int(getattr(piece, "id", -1)) == current_id,
 					}
 				)
@@ -3589,8 +4046,8 @@ class MainUI:
 		window.title("属性设置")
 		window.transient(self.root)
 		window.resizable(True, True)
-		window.geometry("780x460")
-		window.minsize(680, 380)
+		window.geometry("860x460")
+		window.minsize(760, 380)
 		self.attribute_settings_window = window
 
 		main = ttk.Frame(window, padding=10)
@@ -4253,24 +4710,49 @@ class MainUI:
 		return result
 
 	def _get_piece_row_values(self, slot_key: str, runtime_map: dict[str, Any], mock_map: dict[str, int]) -> dict[str, str]:
-		if self.attribute_settings_force_init_mode and self.selected_source == "runtime":
-			default_cfg = {
-				"hp": "-",
-				"strength": "10",
-				"dexterity": "10",
-				"intelligence": "10",
-				"physical_resist": "6",
-				"magic_resist": "6",
-				"physical_damage": "6",
-				"magic_damage": "6",
-				"action_points": "2",
-				"max_action_points": "2",
-				"spell_slots": "2",
-				"max_spell_slots": "2",
-				"movement": "10",
-				"pos_x": "0",
-				"pos_y": "0",
-			}
+		if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
+			if self._is_profession_mode():
+				default_cfg = {
+					"hp": "-",
+					"profession": "战士(长)",
+					"weapon": "长剑",
+					"armor": "轻甲",
+					"strength": "10",
+					"dexterity": "10",
+					"intelligence": "10",
+					"physical_resist": "8",
+					"magic_resist": "10",
+					"physical_damage": "18",
+					"magic_damage": "0",
+					"action_points": "1",
+					"max_action_points": "1",
+					"spell_slots": "3",
+					"max_spell_slots": "3",
+					"movement": "28",
+					"pos_x": "0",
+					"pos_y": "0",
+				}
+			else:
+				default_cfg = {
+					"hp": "-",
+					"profession": "自定义",
+					"weapon": "自定义",
+					"armor": "无甲",
+					"strength": "10",
+					"dexterity": "10",
+					"intelligence": "10",
+					"physical_resist": "6",
+					"magic_resist": "6",
+					"physical_damage": "6",
+					"magic_damage": "6",
+					"action_points": "2",
+					"max_action_points": "2",
+					"spell_slots": "2",
+					"max_spell_slots": "2",
+					"movement": "10",
+					"pos_x": "0",
+					"pos_y": "0",
+				}
 			cfg = self.runtime_piece_init_config.get(slot_key, {})
 			for key, val in cfg.items():
 				default_cfg[key] = str(val)
@@ -4278,6 +4760,9 @@ class MainUI:
 
 		default_values = {
 			"hp": "0",
+			"profession": "自定义",
+			"weapon": "自定义",
+			"armor": "无甲",
 			"strength": "0",
 			"dexterity": "0",
 			"intelligence": "0",
@@ -4300,8 +4785,28 @@ class MainUI:
 			pos = getattr(piece, "position", None)
 			px = int(getattr(pos, "x", 0)) if pos is not None else 0
 			py = int(getattr(pos, "y", 0)) if pos is not None else 0
+			weapon_raw = getattr(piece, "weapon", "自定义")
+			weapon_id = self._safe_int(str(weapon_raw), 0)
+			if weapon_id in (1, 2, 3, 4):
+				weapon_label = self._weapon_id_to_weapon_label(weapon_id)
+			else:
+				weapon_label = self._normalize_weapon_label(str(weapon_raw)) or "自定义"
+				weapon_id = self._weapon_label_to_weapon_id(weapon_label)
+
+			armor_raw = getattr(piece, "armor", "无甲")
+			armor_id = self._safe_int(str(armor_raw), 0)
+			if armor_id in (1, 2, 3):
+				armor_label = self._armor_id_to_armor_label(armor_id)
+			else:
+				armor_label = str(armor_raw or "无甲")
+				armor_id = self._armor_label_to_armor_id(armor_label)
+
+			profession_label = self._weapon_id_to_profession_display(weapon_id)
 			return {
 				"hp": str(int(getattr(piece, "health", 0))),
+				"profession": profession_label,
+				"weapon": weapon_label,
+				"armor": armor_label,
 				"strength": str(int(getattr(piece, "strength", 0))),
 				"dexterity": str(int(getattr(piece, "dexterity", 0))),
 				"intelligence": str(int(getattr(piece, "intelligence", 0))),
@@ -4322,8 +4827,15 @@ class MainUI:
 		if soldier_id is None:
 			return default_values
 		stats = self.mock_piece_stats_by_id.get(soldier_id, {})
+		weapon_label = self._normalize_weapon_label(str(stats.get("weapon", "自定义"))) or "自定义"
+		weapon_id = self._weapon_label_to_weapon_id(weapon_label)
+		armor_label = str(stats.get("armor", "无甲")) or "无甲"
+		profession_label = self._weapon_id_to_profession_display(weapon_id)
 		return {
 			"hp": str(int(self.mock_last_health_by_id.get(soldier_id, stats.get("health", 0)))),
+			"profession": profession_label,
+			"weapon": weapon_label,
+			"armor": armor_label,
 			"strength": str(int(stats.get("strength", 0))),
 			"dexterity": str(int(stats.get("dexterity", 0))),
 			"intelligence": str(int(stats.get("intelligence", 0))),
@@ -4519,7 +5031,7 @@ class MainUI:
 	def _apply_piece_attribute_changes(self) -> None:
 		if not self.loaded:
 			self.right_info_panel.append_content("\n[UI] 当前未加载对局，无法应用棋子属性")
-			if not (self.attribute_settings_force_init_mode and self.selected_source == "runtime"):
+			if not (self.attribute_settings_force_init_mode and self._is_runtime_selected_source()):
 				return
 
 		runtime_map = self._runtime_piece_slot_map()
@@ -4528,7 +5040,7 @@ class MainUI:
 		warnings: list[str] = []
 		active_slots_by_team: dict[int, list[str]] = {1: [], 2: []}
 		planned_positions: dict[str, tuple[int, int]] = {}
-		allow_unset_hp = bool(self.attribute_settings_force_init_mode and self.selected_source == "runtime")
+		allow_unset_hp = bool(self.attribute_settings_force_init_mode and self._is_runtime_selected_source())
 		self._clear_attribute_error_highlight()
 
 		# 先做输入规范化（含范围夹紧）并回填到界面。
@@ -4545,6 +5057,16 @@ class MainUI:
 				slot_unset = allow_unset_hp and slot_hp_raw in ("", "-", "-1")
 				for field, var in vars_dict.items():
 					if slot_unset and field != "hp":
+						continue
+					if field in ("profession", "weapon", "armor"):
+						normalized = str(var.get()).strip()
+						if not normalized:
+							if field == "armor":
+								normalized = "无甲"
+							else:
+								normalized = "自定义"
+						if var.get() != normalized:
+							var.set(normalized)
 						continue
 					normalized, warn = self._normalize_piece_value(
 						slot_display_name=slot_name,
@@ -4632,13 +5154,31 @@ class MainUI:
 			return
 
 		# 后端强制初始化：必须双方至少各有一个有效棋子。
-		if self.attribute_settings_force_init_mode and self.selected_source == "runtime":
+		if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
 			team1_count = len(active_slots_by_team[1])
 			team2_count = len(active_slots_by_team[2])
 			if team1_count == 0 and team2_count == 0:
 				self._mark_attribute_field_error("p1_1", "hp")
 				self._mark_attribute_field_error("p2_1", "hp")
 				self._show_attribute_warning_feedback("当前场上未有有效棋子！请设置双方至少各一个棋子的血量")
+				return
+
+		# 职业模式：有效棋子必须选择非“自定义”职业。
+		if self._is_profession_mode():
+			invalid_slots: list[str] = []
+			for team_id in (1, 2):
+				for slot_key in active_slots_by_team[team_id]:
+					vars_dict = self.attribute_piece_vars.get(slot_key)
+					if vars_dict is None:
+						continue
+					prof_var = vars_dict.get("profession")
+					profession = str(prof_var.get()).strip() if prof_var is not None else ""
+					if profession in ("", "自定义"):
+						invalid_slots.append(slot_key)
+			if invalid_slots:
+				for slot_key in invalid_slots:
+					self._mark_attribute_field_error(slot_key, "profession")
+				self._show_attribute_warning_feedback("职业模式：有效棋子必须选择武器以确定职业，职业不能为自定义")
 				return
 			if team1_count == 0:
 				self._mark_attribute_field_error("p1_1", "hp")
@@ -4654,7 +5194,7 @@ class MainUI:
 			if vars_dict is None:
 				continue
 
-			if self.attribute_settings_force_init_mode and self.selected_source == "runtime":
+			if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
 				cfg = self.runtime_piece_init_config.setdefault(slot_key, {})
 				for field, var in vars_dict.items():
 					cfg[field] = var.get()
@@ -4693,6 +5233,18 @@ class MainUI:
 					int(piece.max_spell_slots),
 				)
 				piece.movement = self._safe_float(vars_dict["movement"].get(), float(getattr(piece, "movement", 0.0)))
+				if self._is_runtime_selected_source():
+					weapon_label = (
+						self._normalize_weapon_label(str(vars_dict.get("weapon").get()).strip())
+						if vars_dict.get("weapon")
+						else "自定义"
+					)
+					armor_label = str(vars_dict.get("armor").get()).strip() if vars_dict.get("armor") else "无甲"
+					weapon_id = self._weapon_label_to_weapon_id(weapon_label)
+					armor_id = self._armor_label_to_armor_id(armor_label)
+					piece.type = self._weapon_id_to_piece_type(weapon_id)
+					setattr(piece, "weapon", int(weapon_id))
+					setattr(piece, "armor", int(armor_id))
 				if getattr(piece, "position", None) is not None:
 					piece.position.x = px
 					piece.position.y = py
@@ -4705,6 +5257,10 @@ class MainUI:
 			if soldier_id is None:
 				continue
 			stats = self.mock_piece_stats_by_id.setdefault(soldier_id, {})
+			if self._is_runtime_selected_source():
+				stats["profession"] = str(vars_dict.get("profession").get()).strip() if vars_dict.get("profession") else "自定义"
+				stats["weapon"] = str(vars_dict.get("weapon").get()).strip() if vars_dict.get("weapon") else "自定义"
+				stats["armor"] = str(vars_dict.get("armor").get()).strip() if vars_dict.get("armor") else "无甲"
 			px, py = self._clamp_piece_position(
 				self._safe_int(vars_dict["pos_x"].get(), int(self.mock_initial_positions.get(soldier_id, {}).get("x", 0))),
 				self._safe_int(vars_dict["pos_y"].get(), int(self.mock_initial_positions.get(soldier_id, {}).get("y", 0))),
@@ -4743,7 +5299,7 @@ class MainUI:
 		if warnings:
 			self._show_attribute_warning_feedback(f"{warnings[0]}（自动修正为最近边界值）")
 
-		if self.attribute_settings_force_init_mode and self.selected_source == "runtime":
+		if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
 			self.runtime_init_config_ready = True
 			self.right_info_panel.append_content("\n[UI] 后端模式初始化属性已确认")
 			self._show_attribute_apply_feedback("应用成功")
@@ -4812,7 +5368,7 @@ class MainUI:
 
 		enabled_map: dict[str, bool] = {}
 		for slot_key in slot_keys:
-			if self.attribute_settings_force_init_mode and self.selected_source == "runtime":
+			if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
 				enabled_map[slot_key] = True
 			else:
 				enabled_map[slot_key] = slot_key in runtime_map if self.controller.runtime_source == "runtime_env" else slot_key in mock_map
@@ -4820,7 +5376,25 @@ class MainUI:
 			self.attribute_piece_entries[slot_key] = {}
 			self.attribute_piece_last_edit_tick[slot_key] = 0
 
+		weapon_values = ["自定义", "长剑", "短剑", "弓", "法杖"]
+		armor_values = ["无甲", "轻甲", "中甲", "重甲"]
+		if self._is_profession_mode():
+			weapon_values = ["长剑", "短剑", "弓", "法杖"]
+			armor_values = ["轻甲", "中甲", "重甲"]
+		combo_values: dict[str, list[str]] = {
+			"weapon": weapon_values,
+			"armor": armor_values,
+		}
+
 		field_groups: list[tuple[str, list[tuple[str, str]]]] = [
+			(
+				"职业与装备",
+				[
+					("profession", "职业"),
+					("weapon", "武器"),
+					("armor", "护甲"),
+				],
+			),
 			(
 				"基础与战斗属性",
 				[
@@ -4847,6 +5421,25 @@ class MainUI:
 				],
 			),
 		]
+		show_profession_section = self._normalize_selected_source_value(self.selected_source) in (
+			"runtime_custom",
+			"runtime_profession",
+		)
+		if not show_profession_section:
+			field_groups = field_groups[1:]
+
+		derived_fields: set[str] = {
+			"physical_resist",
+			"magic_resist",
+			"physical_damage",
+			"magic_damage",
+			"action_points",
+			"max_action_points",
+			"spell_slots",
+			"max_spell_slots",
+			"movement",
+		}
+		lock_all_stats = self._is_profession_mode() and not self.attribute_settings_force_init_mode
 
 		def render_matrix(
 			parent: ttk.Frame,
@@ -4887,37 +5480,77 @@ class MainUI:
 					var = tk.StringVar(value=values[field])
 					var.trace_add("write", lambda *_args, sk=slot_key, fd=field: self._on_attribute_var_changed(sk, fd))
 					state = "normal" if enabled_map.get(slot_key, False) else "disabled"
-					entry = tk.Entry(
-						table,
-						textvariable=var,
-						width=9,
-						state=state,
-						fg="#111111",
-						disabledforeground="#9ca3af",
-					)
-					entry.grid(row=field_row, column=col_idx, sticky="ew", padx=(0, 6), pady=3)
+					if lock_all_stats and field not in ("pos_x", "pos_y", "hp"):
+						state = "disabled"
+					widget: Any
+					if field == "profession":
+						entry_state = "readonly" if state == "normal" else "disabled"
+						entry = tk.Entry(
+							table,
+							textvariable=var,
+							width=9,
+							state=entry_state,
+							fg="#111111",
+							disabledforeground="#9ca3af",
+							readonlybackground="#f3f4f6",
+						)
+						entry.grid(row=field_row, column=col_idx, sticky="ew", padx=(0, 6), pady=3)
+						widget = entry
+					elif field in ("weapon", "armor"):
+						combo_state = "readonly" if state == "normal" else "disabled"
+						combo = ttk.Combobox(
+							table,
+							textvariable=var,
+							values=combo_values.get(field, []),
+							state=combo_state,
+							width=9,
+						)
+						combo.grid(row=field_row, column=col_idx, sticky="ew", padx=(0, 6), pady=3)
+						widget = combo
+					else:
+						if self._is_profession_mode() and field in derived_fields:
+							state = "disabled"
+						entry = tk.Entry(
+							table,
+							textvariable=var,
+							width=9,
+							state=state,
+							fg="#111111",
+							disabledforeground="#9ca3af",
+						)
+						entry.grid(row=field_row, column=col_idx, sticky="ew", padx=(0, 6), pady=3)
+						widget = entry
 					self.attribute_piece_vars[slot_key][field] = var
-					self.attribute_piece_entries[slot_key][field] = entry
+					self.attribute_piece_entries[slot_key][field] = widget
 
 			return row_idx + 1
 
 		row_cursor = 0
-		row_cursor = render_matrix(
-			scroll_content,
-			field_groups[0][1],
-			start_row=row_cursor,
-			title=field_groups[0][0],
-		)
-		row_cursor += 1
-		row_cursor = render_matrix(
-			scroll_content,
-			field_groups[1][1],
-			start_row=row_cursor,
-			title="天赋属性（单独配置）",
-			highlight="#7c3aed",
-		)
+		for group_title, group_fields in field_groups:
+			display_title = group_title
+			highlight = None
+			if group_title == "天赋属性":
+				display_title = "天赋属性（单独配置）"
+				highlight = "#7c3aed"
+			row_cursor = render_matrix(
+				scroll_content,
+				group_fields,
+				start_row=row_cursor,
+				title=display_title,
+				highlight=highlight,
+			)
+			row_cursor += 1
 
-		if self.attribute_settings_force_init_mode and self.selected_source == "runtime":
+		for slot_key in slot_keys:
+			if self._is_profession_mode():
+				self._update_profession_display_and_presets(slot_key)
+			else:
+				self._update_custom_mode_equipment_presets(
+					slot_key,
+					update_stats=bool(self.attribute_settings_force_init_mode and self._is_runtime_selected_source()),
+				)
+
+		if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
 			ttk.Label(
 				scroll_content,
 				text="后端模式初始化：请至少为双方各配置一个有效棋子（血量非“-”且 > 0）。",

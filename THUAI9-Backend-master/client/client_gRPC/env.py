@@ -330,6 +330,9 @@ class Player:
             
             self.set_weapon(weapon, piece)
             self.set_armor(armor, piece)
+
+            # 护甲会改变 max_movement，需要同步当前 movement。
+            accessor.set_movement_to(piece.max_movement)
             
             position = Point(features[5], features[6])
             accessor.set_position(position)
@@ -923,10 +926,6 @@ class Environment:
             accessor.set_dexterity_to(piece_arg.dexterity)
             accessor.set_intelligence_to(piece_arg.intelligence)
             
-            # 设置装备
-            player.set_weapon(piece_arg.equip.x, piece)  # x为武器类型
-            player.set_armor(piece_arg.equip.y, piece)   # y为防具类型
-            
             # 设置位置
             accessor.set_position(piece_arg.pos)
             accessor.set_height_to(self.board.height_map[piece_arg.pos.x][piece_arg.pos.y])
@@ -939,6 +938,10 @@ class Environment:
             accessor.set_max_spell_slots()
             accessor.set_spell_slots_to(piece.max_spell_slots)
             accessor.set_max_movement_to(piece_arg.dexterity + 0.5 * piece_arg.strength + 10)
+
+            # 设置装备（护甲会改变 max_movement，所以必须在 set_max_movement_to 之后）
+            player.set_weapon(piece_arg.equip.x, piece)  # x为武器类型
+            player.set_armor(piece_arg.equip.y, piece)   # y为防具类型
             accessor.set_movement_to(piece.max_movement)
             
         player.pieces = np.array(pieces_list, dtype=object)

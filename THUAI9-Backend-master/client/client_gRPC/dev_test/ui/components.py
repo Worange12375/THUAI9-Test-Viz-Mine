@@ -82,7 +82,9 @@ class InfoPanel(ttk.LabelFrame):
 
 	def _pick_tag(self, line: str) -> str:
 		line_lower = line.lower()
-		if any(keyword in line for keyword in ("对局结束", "游戏结束", "已死亡", "死亡", "胜者", "已暂停")):
+		if any(keyword in line for keyword in ("对局结束", "游戏结束", "已死亡", "死亡", "胜者", "已暂停", "濒死", "死亡检定")):
+			return self._tag_important
+		if "[deathcheck]" in line_lower:
 			return self._tag_important
 		if "game_over" in line_lower:
 			return self._tag_important
@@ -341,13 +343,17 @@ class PieceSquareCard(tk.Frame):
 		body_font = ("Microsoft YaHei UI", 9 if is_large else 8)
 		small_font = ("Microsoft YaHei UI", 8 if is_large else 7)
 
-		self.header_label = tk.Label(self, text="-", font=header_font, bg="#f3f4f6", fg="#111827", anchor="w")
+		self.header_container = tk.Frame(self, bg="#f3f4f6")
+		self.header_id_label = tk.Label(self.header_container, text="-", font=header_font, bg="#f3f4f6", fg="#111827", anchor="w")
+		self.header_extra_label = tk.Label(self.header_container, text="", font=header_font, bg="#f3f4f6", fg="#111827", anchor="w")
 		self.status_label = tk.Label(self, text="HP:-  (-,-)", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
 		self.combat_label = tk.Label(self, text="🛡 -/-  ✨ -/-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
 		self.talent_label = tk.Label(self, text="敏- 智- 力-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
 		self.resource_label = tk.Label(self, text="法-/- 行-/- 移-", font=small_font, bg="#f3f4f6", fg="#334155", anchor="w")
 
-		self.header_label.pack(fill="x", padx=6, pady=(4, 1))
+		self.header_container.pack(fill="x", padx=6, pady=(4, 1))
+		self.header_id_label.pack(side="left")
+		self.header_extra_label.pack(side="left", padx=(4, 0))
 		self.status_label.pack(fill="x", padx=6, pady=0)
 		self.combat_label.pack(fill="x", padx=6, pady=0)
 		self.talent_label.pack(fill="x", padx=6, pady=0)
@@ -355,7 +361,9 @@ class PieceSquareCard(tk.Frame):
 
 	def _apply_colors(self, bg: str, fg: str) -> None:
 		self.configure(background=bg)
-		self.header_label.configure(bg=bg, fg=fg)
+		self.header_container.configure(bg=bg)
+		self.header_id_label.configure(bg=bg, fg=fg)
+		self.header_extra_label.configure(bg=bg, fg=fg)
 		self.status_label.configure(bg=bg, fg=fg)
 		self.combat_label.configure(bg=bg, fg=fg)
 		self.talent_label.configure(bg=bg, fg=fg)
@@ -380,10 +388,17 @@ class PieceSquareCard(tk.Frame):
 		intelligence: str = "-",
 		strength: str = "-",
 		header_text: str | None = None,
+		is_dying: bool = False,
 		is_inactive: bool = False,
 	) -> None:
 		"""更新卡片显示信息与高亮状态。"""
-		self.header_label.configure(text=header_text if header_text is not None else f"player{team}-{piece_no}")
+		header_raw = header_text if header_text is not None else f"player{team}-{piece_no}"
+		header_raw = str(header_raw)
+		id_part, extra_part = header_raw, ""
+		if " " in header_raw:
+			id_part, extra_part = header_raw.split(" ", 1)
+		self.header_id_label.configure(text=id_part)
+		self.header_extra_label.configure(text=extra_part)
 		self.status_label.configure(text=f"HP:{hp}  {position_text}")
 		self.combat_label.configure(text=f"🛡 {physical_damage}/{physical_resist}  ✨ {magic_damage}/{magic_resist}")
 		self.talent_label.configure(text=f"敏{dexterity} 智{intelligence} 力{strength}")
@@ -406,6 +421,11 @@ class PieceSquareCard(tk.Frame):
 			self._apply_colors(focus_bg, base_fg)
 		else:
 			self._apply_colors(base_bg, base_fg)
+
+		if is_dying:
+			# 濒死态：简写 ID 变灰，HP 行文字变深棕色。
+			self.header_id_label.configure(fg="#6b7280")
+			self.status_label.configure(fg="#7f1d1d")
 
 
 class RightTopCompositePanel(ttk.LabelFrame):
@@ -808,14 +828,38 @@ class ChessboardPanel(ttk.LabelFrame):
 
 			if isinstance(label, str) and label:
 				font_size = max(7, int(self.cell_size * 0.22))
-				self.canvas.create_text(
-					(cx0 + cx1) / 2,
-					(cy0 + cy1) / 2,
-					text=label,
-					fill="#FFFFFF",
-					font=("Microsoft YaHei UI", font_size, "bold"),
-					justify="center",
-				)
+				emoji_font_size = max(7, int(self.cell_size * 0.18))
+				cx = (cx0 + cx1) / 2
+				cy = (cy0 + cy1) / 2
+				if "\n" in label:
+					line1, line2 = label.split("\n", 1)
+					offset_y = max(3.0, self.cell_size * 0.14)
+					self.canvas.create_text(
+						cx,
+						cy - offset_y,
+						text=line1,
+						fill="#FFFFFF",
+						font=("Microsoft YaHei UI", font_size, "bold"),
+						justify="center",
+					)
+					if line2.strip():
+						self.canvas.create_text(
+							cx,
+							cy + offset_y,
+							text=line2,
+							fill="#FFFFFF",
+							font=("Microsoft YaHei UI", emoji_font_size, "normal"),
+							justify="center",
+						)
+				else:
+					self.canvas.create_text(
+						cx,
+						cy,
+						text=label,
+						fill="#FFFFFF",
+						font=("Microsoft YaHei UI", font_size, "bold"),
+						justify="center",
+					)
 
 	def _draw_trap_markers(self) -> None:
 		if self.cell_size <= 0:
