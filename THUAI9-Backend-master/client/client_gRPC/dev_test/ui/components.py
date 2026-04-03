@@ -347,7 +347,7 @@ class PieceSquareCard(tk.Frame):
 		self.header_id_label = tk.Label(self.header_container, text="-", font=header_font, bg="#f3f4f6", fg="#111827", anchor="w")
 		self.header_extra_label = tk.Label(self.header_container, text="", font=header_font, bg="#f3f4f6", fg="#111827", anchor="w")
 		self.status_label = tk.Label(self, text="HP:-  (-,-)", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
-		self.combat_label = tk.Label(self, text="🛡 -/-  ✨ -/-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
+		self.combat_label = tk.Label(self, text="⚔️ - 🛡 - ✨️ - 🔮 -", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
 		self.talent_label = tk.Label(self, text="敏- 智- 力-", font=body_font, bg="#f3f4f6", fg="#1f2937", anchor="w")
 		self.resource_label = tk.Label(self, text="法-/- 行-/- 移-", font=small_font, bg="#f3f4f6", fg="#334155", anchor="w")
 
@@ -400,7 +400,9 @@ class PieceSquareCard(tk.Frame):
 		self.header_id_label.configure(text=id_part)
 		self.header_extra_label.configure(text=extra_part)
 		self.status_label.configure(text=f"HP:{hp}  {position_text}")
-		self.combat_label.configure(text=f"🛡 {physical_damage}/{physical_resist}  ✨ {magic_damage}/{magic_resist}")
+		self.combat_label.configure(
+			text=f"⚔️{physical_damage} 🛡{physical_resist} ✨️{magic_damage} 🔮{magic_resist}"
+		)
 		self.talent_label.configure(text=f"敏{dexterity} 智{intelligence} 力{strength}")
 		self.resource_label.configure(text=f"法{spell_slots} 行{action_points} 移{movement}")
 
