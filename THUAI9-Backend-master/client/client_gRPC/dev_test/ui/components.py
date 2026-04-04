@@ -536,6 +536,7 @@ class ChessboardPanel(ttk.LabelFrame):
 		self.spell_aoe_cells: list[tuple[int, int]] = []
 		self.spell_aoe_color = "#f97316"
 		self.trap_markers: list[dict[str, Any]] = []
+		self.target_markers: list[dict[str, Any]] = []
 		self.click_handler: Callable[[int | None, int | None], None] | None = None
 		self._trap_image_raw: tk.PhotoImage | None = None
 		self._trap_image_cache: dict[int, tk.PhotoImage] = {}
@@ -612,6 +613,14 @@ class ChessboardPanel(ttk.LabelFrame):
 	def set_trap_markers(self, markers: list[dict[str, Any]] | None) -> None:
 		"""设置陷阱标记列表，元素包含 x/y/remaining。"""
 		self.trap_markers = list(markers) if isinstance(markers, list) else []
+		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())
+
+	def set_target_markers(self, markers: list[dict[str, Any]] | None) -> None:
+		"""设置目标标记列表。
+
+		元素最小包含：x/y（棋盘格坐标）。可选：text（默认🎯）。
+		"""
+		self.target_markers = list(markers) if isinstance(markers, list) else []
 		self._draw_board(self.canvas.winfo_width(), self.canvas.winfo_height())
 
 	def set_board_state(self, map_rows: list[list[int]] | None, pieces: list[dict[str, Any]] | None) -> None:
@@ -780,7 +789,37 @@ class ChessboardPanel(ttk.LabelFrame):
 				)
 
 		self._draw_pieces()
+		self._draw_target_markers()
 		self._draw_trap_markers()
+
+	def _draw_target_markers(self) -> None:
+		"""在棋子格左上角绘制🎯标记。"""
+		if self.cell_size <= 0:
+			return
+		for marker in self.target_markers:
+			if not isinstance(marker, dict):
+				continue
+			x = marker.get("x")
+			y = marker.get("y")
+			text = marker.get("text", "🎯")
+			if not isinstance(x, int) or not isinstance(y, int):
+				continue
+			if x < 0 or y < 0 or x >= self.board_grid_size or y >= self.board_grid_size:
+				continue
+
+			cx0 = self.board_origin_x + x * self.cell_size
+			cy0 = self.board_origin_y + y * self.cell_size
+			# 更贴近格子左上角（而不是棋子矩形）。
+			pad = max(0.0, self.cell_size * 0.01)
+			font_size = max(9, int(self.cell_size * 0.26))
+			self.canvas.create_text(
+				cx0 + pad,
+				cy0 + pad,
+				text=str(text or "🎯"),
+				fill="#facc15",
+				font=("Microsoft YaHei UI", font_size, "bold"),
+				anchor="nw",
+			)
 
 	def _get_map_value(self, x: int, y: int) -> int:
 		"""获取地图格值。越界或缺失时按不可行处理。"""
@@ -931,6 +970,7 @@ class ChessboardPanel(ttk.LabelFrame):
 		self.map_rows = []
 		self.pieces = []
 		self.trap_markers = []
+		self.target_markers = []
 		self.spell_aoe_cells = []
 		self.move_target_highlight = None
 		self.board_grid_size = self.default_board_grid_size

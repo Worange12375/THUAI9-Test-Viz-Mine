@@ -15,6 +15,7 @@ import numpy as np
 
 import os
 import sys
+import copy
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -119,6 +120,7 @@ class MainUI:
 		self.attribute_piece_apply_status_job: Optional[str] = None
 		self.attribute_piece_warning_label: ttk.Label | None = None
 		self.attribute_piece_warning_job: Optional[str] = None
+		self.attribute_piece_hp_hint_widgets: dict[str, tuple[tk.Label, tk.Label]] = {}
 		self.attribute_action_apply_status_label: ttk.Label | None = None
 		self.attribute_action_warning_label: ttk.Label | None = None
 		self.attribute_action_attack_vars: dict[str, tk.Variable] = {}
@@ -169,13 +171,17 @@ class MainUI:
 		self.action_feedback_label: ttk.Label | None = None
 		self.action_feedback_clear_job: Optional[str] = None
 		self._rendering_action_mode_body = False
+		self.action_panel_status_label: ttk.Label | None = None
 		self.action_attack_target_var.trace_add("write", lambda *_args: self._refresh_custom_attack_preview())
+		self.action_attack_target_var.trace_add("write", lambda *_args: self._refresh_board_view())
+		self.action_attack_type_var.trace_add("write", lambda *_args: self._refresh_board_view())
 		self.action_custom_damage_var.trace_add("write", lambda *_args: self._refresh_custom_attack_preview())
 		self.action_spell_type_var.trace_add("write", lambda *_args: self._rerender_spell_mode_if_needed())
 		self.action_spell_target_var.trace_add("write", lambda *_args: self._refresh_board_view())
 		self.action_spell_point_x_var.trace_add("write", lambda *_args: self._refresh_board_view())
 		self.action_spell_point_y_var.trace_add("write", lambda *_args: self._refresh_board_view())
 		self.game_over_dialog_shown = False
+		self.game_over_message_shown = False
 		self.runtime_cycle_done_piece_ids: set[int] = set()
 		self.runtime_completed_turns = 0
 		self.runtime_last_round_info_line = ""
@@ -435,6 +441,212 @@ class MainUI:
 			self._update_profession_display_and_presets(slot_key)
 		else:
 			self._update_custom_mode_equipment_presets(slot_key, update_stats=False)
+
+	def _compute_custom_mode_stats_via_backend(
+		self,
+		*,
+		strength: int,
+		dexterity: int,
+		intelligence: int,
+		weapon_label: str,
+		armor_label: str,
+	) -> dict[str, str]:
+		"""自定义模式：用后端 env.apply_init_policy 计算派生属性，避免 UI 自己写死规则。"""
+		weapon_id = self._weapon_label_to_weapon_id(self._normalize_weapon_label(weapon_label))
+		armor_id = self._armor_label_to_armor_id(str(armor_label).strip() or "无甲")
+		if weapon_id == 4:
+			# 后端规则：法杖会强制轻甲（与职业模式保持一致）。
+			armor_id = 1
+		env = Environment(local_mode=True, if_log=0)
+		env.create_default_board()
+		arg = PieceArg()
+		arg.strength = int(strength)
+		arg.dexterity = int(dexterity)
+		arg.intelligence = int(intelligence)
+		arg.equip = Point(int(weapon_id), int(armor_id))
+		arg.pos = Point(0, 0)
+		policy = SimpleNamespace(piece_args=[arg])
+		env.apply_init_policy(1, policy)
+		piece = env.player1.pieces[0]
+		movement = float(getattr(piece, "max_movement", getattr(piece, "movement", 0.0)))
+		result = {
+			"hp": str(int(getattr(piece, "max_health", 0))),
+			"physical_resist": str(int(getattr(piece, "physical_resist", 0))),
+			"magic_resist": str(int(getattr(piece, "magic_resist", 0))),
+			"physical_damage": str(int(getattr(piece, "physical_damage", 0))),
+			"magic_damage": str(int(getattr(piece, "magic_damage", 0))),
+			"max_action_points": str(int(getattr(piece, "max_action_points", 0))),
+			"action_points": str(int(getattr(piece, "action_points", 0))),
+			"max_spell_slots": str(int(getattr(piece, "max_spell_slots", 0))),
+			"spell_slots": str(int(getattr(piece, "spell_slots", 0))),
+			"movement": f"{float(movement):.1f}".rstrip("0").rstrip("."),
+		}
+		return result
+
+	def _custom_init_hp_hint_value(self, slot_key: str) -> int:
+		vars_dict = self.attribute_piece_vars.get(slot_key)
+		if not vars_dict:
+			return 50
+		strength_raw = str(vars_dict.get("strength").get()).strip() if vars_dict.get("strength") is not None else "10"
+		strength = self._safe_int(strength_raw, 10)
+		return int(30 + strength * 2)
+
+	def _refresh_custom_init_hp_hint(self, slot_key: str) -> None:
+		widgets = self.attribute_piece_hp_hint_widgets.get(slot_key)
+		if not widgets:
+			return
+		vars_dict = self.attribute_piece_vars.get(slot_key)
+		if not vars_dict:
+			return
+		hp_var = vars_dict.get("hp")
+		if hp_var is None:
+			return
+		hp_raw = str(hp_var.get()).strip()
+		should_show = bool(
+			hp_raw in ("", "-", "-1")
+			and self.attribute_settings_force_init_mode
+			and self._normalize_selected_source_value(self.selected_source) == "runtime_custom"
+		)
+
+		# 兼容：旧实现是 (dash_label, hint_label)；新实现是 (entry, overlay, dash_label, hint_label)
+		if isinstance(widgets, tuple) and len(widgets) == 2:
+			dash_label, hint_label = widgets
+			if should_show:
+				hint_value = self._custom_init_hp_hint_value(slot_key)
+				hint_label.configure(text=f" ({hint_value})")
+				dash_label.grid()
+				hint_label.grid()
+			else:
+				dash_label.grid_remove()
+				hint_label.grid_remove()
+			return
+
+		entry, overlay, dash_label, hint_label = widgets
+		if should_show:
+			hint_value = self._custom_init_hp_hint_value(slot_key)
+			hint_label.configure(text=f" ({hint_value})")
+			try:
+				# 覆盖在 Entry 内部左侧，不占用 Entry 内容。
+				overlay.place(in_=entry, x=4, y=1, relheight=1)
+			except Exception:
+				pass
+		else:
+			try:
+				overlay.place_forget()
+			except Exception:
+				pass
+
+	def _one_click_fill_custom_init(self) -> None:
+		"""仅用于“后端模式初始化属性窗口”：一键写入 6 棋子经典配置。"""
+		if not (
+			self.attribute_settings_force_init_mode
+			and self._normalize_selected_source_value(self.selected_source) in ("runtime_custom", "runtime_profession")
+		):
+			return
+		fixed_positions: dict[str, tuple[int, int]] = {
+			"p1_1": (3, 8),
+			"p1_2": (8, 3),
+			"p1_3": (17, 4),
+			"p2_1": (16, 11),
+			"p2_2": (11, 16),
+			"p2_3": (2, 15),
+		}
+		preset: dict[str, dict[str, Any]] = {
+			"p1_1": {"weapon": "长剑", "armor": "重甲", "strength": 20, "dexterity": 8, "intelligence": 2},
+			"p1_2": {"weapon": "弓", "armor": "轻甲", "strength": 14, "dexterity": 16, "intelligence": 0},
+			"p1_3": {"weapon": "短剑", "armor": "中甲", "strength": 16, "dexterity": 12, "intelligence": 2},
+			"p2_1": {"weapon": "法杖", "armor": "轻甲", "strength": 14, "dexterity": 2, "intelligence": 14},
+			"p2_2": {"weapon": "短剑", "armor": "轻甲", "strength": 14, "dexterity": 14, "intelligence": 2},
+			"p2_3": {"weapon": "弓", "armor": "轻甲", "strength": 14, "dexterity": 16, "intelligence": 0},
+		}
+		self.attribute_internal_update = True
+		try:
+			for slot_key in self._piece_slot_keys():
+				vars_dict = self.attribute_piece_vars.get(slot_key)
+				if not vars_dict:
+					continue
+				conf = preset.get(slot_key, {})
+				px, py = fixed_positions.get(slot_key, (0, 0))
+				px, py = self._clamp_piece_position(px, py)
+				weapon_label = str(conf.get("weapon", "自定义"))
+				armor_label = str(conf.get("armor", "无甲"))
+				strength = int(conf.get("strength", 10))
+				dexterity = int(conf.get("dexterity", 10))
+				intelligence = int(conf.get("intelligence", 10))
+
+				if vars_dict.get("weapon") is not None:
+					vars_dict["weapon"].set(weapon_label)
+				if vars_dict.get("armor") is not None:
+					vars_dict["armor"].set(armor_label)
+				if vars_dict.get("strength") is not None:
+					vars_dict["strength"].set(str(strength))
+				if vars_dict.get("dexterity") is not None:
+					vars_dict["dexterity"].set(str(dexterity))
+				if vars_dict.get("intelligence") is not None:
+					vars_dict["intelligence"].set(str(intelligence))
+
+				weapon_id = self._weapon_label_to_weapon_id(self._normalize_weapon_label(weapon_label))
+				if vars_dict.get("profession") is not None:
+					vars_dict["profession"].set(self._weapon_id_to_profession_label_simple(weapon_id))
+
+				derived = self._compute_custom_mode_stats_via_backend(
+					strength=strength,
+					dexterity=dexterity,
+					intelligence=intelligence,
+					weapon_label=weapon_label,
+					armor_label=armor_label,
+				)
+				for key in (
+					"hp",
+					"physical_resist",
+					"magic_resist",
+					"physical_damage",
+					"magic_damage",
+					"action_points",
+					"max_action_points",
+					"spell_slots",
+					"max_spell_slots",
+					"movement",
+				):
+					if vars_dict.get(key) is not None and key in derived:
+						vars_dict[key].set(str(derived[key]))
+				if vars_dict.get("pos_x") is not None:
+					vars_dict["pos_x"].set(str(px))
+				if vars_dict.get("pos_y") is not None:
+					vars_dict["pos_y"].set(str(py))
+		finally:
+			self.attribute_internal_update = False
+
+		# 自定义初始化：hp 输入必须在 0-200（不自动夹紧），超范围/非法直接阻止开局。
+		if (
+			self.attribute_settings_force_init_mode
+			and self._is_runtime_selected_source()
+			and self._normalize_selected_source_value(self.selected_source) == "runtime_custom"
+			and (not self._is_profession_mode())
+		):
+			for slot_key in self._piece_slot_keys():
+				vars_dict = self.attribute_piece_vars.get(slot_key)
+				if vars_dict is None:
+					continue
+				hp_raw = str(vars_dict.get("hp").get()).strip() if vars_dict.get("hp") is not None else ""
+				if hp_raw in ("", "-", "-1"):
+					continue
+				try:
+					hp_value = int(float(hp_raw))
+				except Exception:
+					slot_name = f"player{slot_key[1]}-{slot_key[-1]}"
+					self._mark_attribute_field_error(slot_key, "hp")
+					self._show_attribute_warning_feedback(f"{slot_name} 的血量必须是整数，且范围为 0-200")
+					return
+				if hp_value < 0 or hp_value > 200:
+					slot_name = f"player{slot_key[1]}-{slot_key[-1]}"
+					self._mark_attribute_field_error(slot_key, "hp")
+					self._show_attribute_warning_feedback(f"{slot_name} 的血量超出范围：0-200")
+					return
+
+		for slot_key in self._piece_slot_keys():
+			self._refresh_custom_init_hp_hint(slot_key)
+		self.right_info_panel.append_content("\n[UI] 已填入经典 6 棋子配置，请点击“应用”开始")
 
 	def _weapon_id_to_piece_type(self, weapon_id: int) -> str:
 		wid = int(weapon_id)
@@ -738,6 +950,8 @@ class MainUI:
 		self.runtime_completed_turns = 0
 		self.runtime_last_round_info_line = ""
 		self.game_over_dialog_shown = False
+		self.game_over_message_shown = False
+		self.action_panel_status_label = None
 		try:
 			self.controller.select_mode("manual")
 			if self._is_runtime_selected_source():
@@ -764,6 +978,7 @@ class MainUI:
 					self._apply_runtime_piece_config_to_environment()
 					self._initialize_runtime_card_slots()
 					self._install_runtime_env_deathcheck_hook(env)
+					self._check_and_announce_runtime_game_over(env, show_dialog=True)
 					self._show_initiative_summary_popup()
 				self.loaded = True
 				self.left_board_panel.reset_board_state()
@@ -851,6 +1066,47 @@ class MainUI:
 		setattr(env, "roll_dice", roll_dice_hook)
 		setattr(env, "handle_death_check", handle_death_check_hook)
 
+	def _is_piece_alive_by_hp(self, piece: Any) -> bool:
+		"""统一存活判定：仅 HP>0 视为存活；HP==0 视为死亡。
+
+		说明：负 HP 在初始化输入阶段视为非法；在对局结算中若出现负值，这里按 0 处理。
+		"""
+		if piece is None:
+			return False
+		try:
+			hp = int(getattr(piece, "health", 0))
+		except Exception:
+			hp = 0
+		if hp < 0:
+			hp = 0
+		# 兼容 env 内部 is_alive 字段，但以 HP 为准。
+		return hp > 0
+
+	def _check_and_announce_runtime_game_over(self, env: Any, *, show_dialog: bool) -> None:
+		"""在 UI 侧主动检查并播报胜负。
+
+		用于：
+		- 手动应用属性后（可能直接把某方全灭）
+		- 初始化配置应用后（防止 0HP 开局未触发任何行动导致不结算）
+		"""
+		if env is None:
+			return
+		# 去重：若 env 或 UI 已标记结束，则不重复播报。
+		if bool(getattr(env, "is_game_over", False)) or bool(getattr(self, "game_over_message_shown", False)):
+			return
+		p1_pieces = self._coerce_piece_list(getattr(getattr(env, "player1", None), "pieces", []))
+		p2_pieces = self._coerce_piece_list(getattr(getattr(env, "player2", None), "pieces", []))
+		p1_alive = any(self._is_piece_alive_by_hp(p) for p in p1_pieces)
+		p2_alive = any(self._is_piece_alive_by_hp(p) for p in p2_pieces)
+		if p1_alive and p2_alive:
+			return
+		winner = "玩家1" if p1_alive else ("玩家2" if p2_alive else "无人")
+		setattr(env, "is_game_over", True)
+		self.game_over_message_shown = True
+		self.right_info_panel.append_content(f"\n游戏结束，胜者：{winner}")
+		if show_dialog and self.controller.runtime_source == "runtime_env":
+			self._show_game_over_reset_dialog()
+
 	def _prepare_runtime_piece_init_defaults(self) -> None:
 		"""准备后端模式初始化阶段的 6 槽位默认配置。"""
 		if self.runtime_piece_init_config:
@@ -866,20 +1122,28 @@ class MainUI:
 			height = int(getattr(board, "height", height))
 			border = int(getattr(board, "boarder", border))
 
-		def default_pos(team: int, idx: int) -> tuple[int, int]:
-			x = min(width - 1, max(0, 2 + (idx - 1) * 2))
-			if team == 1:
-				y = min(max(0, border - 1), height - 1)
-			else:
-				y = min(max(0, border + 1), height - 1)
-			return x, y
+		fixed_positions: dict[str, tuple[int, int]] = {
+			"p1_1": (3, 8),
+			"p1_2": (8, 3),
+			"p1_3": (17, 4),
+			"p2_1": (16, 11),
+			"p2_2": (11, 16),
+			"p2_3": (2, 15),
+		}
+
+		def clamp_pos(x: int, y: int) -> tuple[int, int]:
+			cx = max(0, min(int(x), max(0, width - 1)))
+			cy = max(0, min(int(y), max(0, height - 1)))
+			return cx, cy
 
 		for team in (1, 2):
 			for idx in (1, 2, 3):
-				x, y = default_pos(team, idx)
+				slot_key = f"p{team}_{idx}"
+				x, y = fixed_positions.get(slot_key, (0, 0))
+				x, y = clamp_pos(x, y)
 				if self._is_profession_mode():
 					# 职业模式：天赋必须手动分配，默认空值；血量/派生属性由后端公式决定，不允许手填。
-					self.runtime_piece_init_config[f"p{team}_{idx}"] = {
+					self.runtime_piece_init_config[slot_key] = {
 						"hp": "-",
 						"strength": "-",
 						"dexterity": "-",
@@ -900,20 +1164,24 @@ class MainUI:
 						"pos_y": str(y),
 					}
 				else:
-					self.runtime_piece_init_config[f"p{team}_{idx}"] = {
-						"hp": "-",
+					# 自定义模式默认数值：显示仍为“自定义/无甲”，但战斗属性默认对齐“长剑+中甲+天赋10”。
+					self.runtime_piece_init_config[slot_key] = {
+						"hp": "",
+						"profession": "自定义",
+						"weapon": "自定义",
+						"armor": "无甲",
 						"strength": "10",
 						"dexterity": "10",
 						"intelligence": "10",
-						"physical_resist": "6",
-						"magic_resist": "6",
-						"physical_damage": "6",
-						"magic_damage": "6",
+						"physical_resist": "15",
+						"magic_resist": "13",
+						"physical_damage": "18",
+						"magic_damage": "0",
 						"action_points": "2",
 						"max_action_points": "2",
 						"spell_slots": "2",
 						"max_spell_slots": "2",
-						"movement": "10",
+						"movement": "25",
 						"pos_x": str(x),
 						"pos_y": str(y),
 					}
@@ -950,6 +1218,37 @@ class MainUI:
 					pass
 				_ = field
 
+		# 同步清理：自定义初始化的 hp placeholder（浮空“-”）颜色。
+		for slot_key, widgets in getattr(self, "attribute_piece_hp_hint_widgets", {}).items():
+			_ = slot_key
+			try:
+				if isinstance(widgets, tuple) and len(widgets) == 4:
+					_dash_label = widgets[2]
+					_dash_label.configure(fg="#111111")
+			except Exception:
+				pass
+
+	def _mark_hp_placeholder_error(self, slot_key: str) -> None:
+		"""仅用于自定义初始化：将浮空 placeholder 的“-”标红。"""
+		widgets = self.attribute_piece_hp_hint_widgets.get(slot_key)
+		if not widgets:
+			return
+		try:
+			if isinstance(widgets, tuple) and len(widgets) == 4:
+				entry, overlay, dash_label, _hint_label = widgets
+				# 确保 placeholder 可见，否则标红看不到。
+				try:
+					overlay.place(in_=entry, x=4, y=1, relheight=1)
+				except Exception:
+					pass
+				dash_label.configure(fg="#dc2626")
+				return
+			if isinstance(widgets, tuple) and len(widgets) == 2:
+				dash_label, _hint_label = widgets
+				dash_label.configure(fg="#dc2626")
+		except Exception:
+			pass
+
 	def _mark_attribute_field_error(self, slot_key: str, field: str) -> None:
 		entry = getattr(self, "attribute_piece_entries", {}).get(slot_key, {}).get(field)
 		if entry is None:
@@ -969,6 +1268,12 @@ class MainUI:
 	def _on_attribute_var_changed(self, slot_key: str, field: str) -> None:
 		if self.attribute_internal_update:
 			return
+		if (
+			field in ("hp", "strength")
+			and self.attribute_settings_force_init_mode
+			and self._normalize_selected_source_value(self.selected_source) == "runtime_custom"
+		):
+			self._refresh_custom_init_hp_hint(slot_key)
 		if field in ("pos_x", "pos_y"):
 			self.attribute_edit_tick_counter += 1
 			self.attribute_piece_last_edit_tick[slot_key] = self.attribute_edit_tick_counter
@@ -1044,9 +1349,17 @@ class MainUI:
 			armor_label = str(cfg.get("armor", "无甲")).strip() or "无甲"
 			weapon_id = self._weapon_label_to_weapon_id(weapon_label)
 			armor_id = self._armor_label_to_armor_id(armor_label)
-			piece.type = self._weapon_id_to_piece_type(weapon_id)
-			setattr(piece, "weapon", int(weapon_id))
-			setattr(piece, "armor", int(armor_id))
+			# 兼容“自定义开局默认显示为自定义/无甲”：避免把初始化时的真实装备覆盖成 0/0。
+			if not (
+				self._normalize_selected_source_value(self.selected_source) == "runtime_custom"
+				and weapon_label == "自定义"
+				and armor_label == "无甲"
+				and int(weapon_id) == 0
+				and int(armor_id) == 0
+			):
+				piece.type = self._weapon_id_to_piece_type(weapon_id)
+				setattr(piece, "weapon", int(weapon_id))
+				setattr(piece, "armor", int(armor_id))
 
 			if board is not None:
 				x = int(piece.position.x)
@@ -1087,14 +1400,22 @@ class MainUI:
 					arg.intelligence = self._safe_int(str(cfg.get("intelligence", 10)), 10)
 				weapon_raw = cfg.get("weapon", 1)
 				weapon_id = self._safe_int(str(weapon_raw), 0)
+				weapon_label = ""
 				if weapon_id not in (1, 2, 3, 4):
-					weapon_label = self._normalize_weapon_label(str(weapon_raw)) or "长剑"
-					weapon_id = self._weapon_label_to_weapon_id(weapon_label) or 1
+					weapon_label = self._normalize_weapon_label(str(weapon_raw)) or "自定义"
+					weapon_id = self._weapon_label_to_weapon_id(weapon_label)
+					# 自定义模式默认：UI 显示“自定义”时，初始化仍按长剑生成（便于保持后端武器相关行为）。
+					if int(weapon_id) == 0 and weapon_label == "自定义":
+						weapon_id = 1
 				armor_raw = cfg.get("armor", 1)
 				armor_id = self._safe_int(str(armor_raw), 0)
+				armor_label = ""
 				if armor_id not in (1, 2, 3):
-					armor_label = str(armor_raw or "轻甲")
-					armor_id = self._armor_label_to_armor_id(armor_label) or 1
+					armor_label = str(armor_raw or "无甲")
+					armor_id = self._armor_label_to_armor_id(armor_label)
+					# 自定义模式默认：UI 显示“无甲”时，初始化仍按中甲生成（与默认数值口径一致）。
+					if int(armor_id) == 0 and armor_label == "无甲":
+						armor_id = 2
 				if weapon_id == 4:
 					armor_id = 1
 				arg.equip = Point(int(weapon_id), int(armor_id))
@@ -1330,6 +1651,38 @@ class MainUI:
 			curr_pos = f"({curr.position.x}, {curr.position.y})"
 
 		_ = (p1_hp, p2_hp, curr_pos)
+		self._refresh_piece_action_status_line()
+
+	def _get_piece_action_status_text(self) -> str:
+		if self.controller.runtime_source == "runtime_env" and self.controller.environment is not None:
+			piece = self._get_runtime_current_piece(self.controller.environment)
+			if piece is not None:
+				piece_code = self._get_piece_short_code(piece)
+				pos = getattr(piece, "position", None)
+				px = int(getattr(pos, "x", -1)) if pos is not None else -1
+				py = int(getattr(pos, "y", -1)) if pos is not None else -1
+				ap = int(getattr(piece, "action_points", 0))
+				max_ap = int(getattr(piece, "max_action_points", ap))
+				sp = int(getattr(piece, "spell_slots", 0))
+				max_sp = int(getattr(piece, "max_spell_slots", sp))
+				return (
+					f"当前行动棋子: {piece_code} | 坐标({px}, {py})"
+					f" | 行动{ap}/{max_ap} | 法术{sp}/{max_sp}"
+				)
+			return "当前行动棋子: 无"
+		return "当前模式暂不提供行动时段驱动"
+
+	def _refresh_piece_action_status_line(self) -> None:
+		label = self.action_panel_status_label
+		if label is None:
+			return
+		try:
+			if not bool(label.winfo_exists()):
+				self.action_panel_status_label = None
+				return
+			label.configure(text=self._get_piece_action_status_text())
+		except Exception:
+			pass
 
 	def _build_team_piece_view_data_runtime(self) -> dict[int, list[dict[str, Any]]]:
 		env = self.controller.environment
@@ -2200,9 +2553,11 @@ class MainUI:
 		if self.attribute_map_pick_waiting:
 			move_target = None
 			spell_overlay = ([], "#f97316")
+			target_markers: list[dict[str, Any]] = []
 		else:
 			move_target = self._get_move_target_highlight()
 			spell_overlay = self._build_spell_aoe_overlay()
+			target_markers = self._build_target_markers_for_board()
 		trap_markers = self._build_runtime_trap_markers()
 		if self.controller.runtime_source == "runtime_env" and self.controller.environment is not None:
 			map_rows = self._extract_runtime_map_rows()
@@ -2211,6 +2566,9 @@ class MainUI:
 			self.left_board_panel.set_move_target_highlight(move_target)
 			self.left_board_panel.set_spell_aoe_overlay(spell_overlay[0], spell_overlay[1])
 			self.left_board_panel.set_trap_markers(trap_markers)
+			# 🎯 目标标记（只在可执行的锁定行动下展示）
+			if hasattr(self.left_board_panel, "set_target_markers"):
+				self.left_board_panel.set_target_markers(target_markers)
 			return
 
 		game_data = self.controller.game_data
@@ -2224,6 +2582,89 @@ class MainUI:
 		self.left_board_panel.set_move_target_highlight(move_target)
 		self.left_board_panel.set_spell_aoe_overlay([], "#f97316")
 		self.left_board_panel.set_trap_markers([])
+		if hasattr(self.left_board_panel, "set_target_markers"):
+			self.left_board_panel.set_target_markers([])
+
+	def _build_target_markers_for_board(self) -> list[dict[str, Any]]:
+		"""根据当前行动面板状态，判断是否应对目标棋子绘制🎯。"""
+		if self.controller.runtime_source != "runtime_env":
+			return []
+		env = self.controller.environment
+		if env is None:
+			return []
+		mode = self.action_ui_mode.get().strip().lower()
+		if mode not in ("attack", "spell"):
+			return []
+
+		actor = self._get_runtime_current_piece(env)
+		if actor is None:
+			return []
+		# 资源：攻击仅看 AP；法术额外看 SP。
+		ap = int(getattr(actor, "action_points", 0))
+		if ap <= 0:
+			return []
+
+		# 攻击：锁定目标+范围判定。
+		if mode == "attack":
+			target_label = self.action_attack_target_var.get().strip()
+			target_piece = self._resolve_action_target_piece(target_label)
+			if target_piece is None:
+				return []
+			attack_type = (self.action_attack_type_var.get().strip() or "物理攻击")
+			# 定制攻击也视为“锁定行动”，但仍按用户期望要求 AP 且要求输入合法。
+			if attack_type == "定制攻击":
+				try:
+					custom_damage = int(self.action_custom_damage_var.get().strip())
+				except Exception:
+					return []
+				if custom_damage <= 0:
+					return []
+			else:
+				try:
+					if not bool(env.is_in_attack_range(actor, target_piece)):
+						return []
+				except Exception:
+					# 若后端环境不支持该判断，则不绘制（避免误导）。
+					return []
+
+			pos = getattr(target_piece, "position", None)
+			x = int(getattr(pos, "x", -1)) if pos is not None else -1
+			y = int(getattr(pos, "y", -1)) if pos is not None else -1
+			if x < 0 or y < 0:
+				return []
+			return [{"x": x, "y": y, "text": "🎯"}]
+
+		# 法术：仅对“锁定法术”显示，且需满足 AP/SP 与射程。
+		spell = self._resolve_selected_spell()
+		if spell is None:
+			return []
+		if self._is_teleport_spell(spell) or self._is_trap_spell(spell):
+			return []
+		is_locking = bool(getattr(spell, "is_locking_spell", False))
+		if not is_locking:
+			return []
+		sp = int(getattr(actor, "spell_slots", 0))
+		spell_cost = int(getattr(spell, "spell_cost", 1))
+		if sp < spell_cost:
+			return []
+
+		target_text = self.action_spell_target_var.get().strip()
+		target_piece = self._resolve_spell_target_piece(target_text, spell, actor)
+		if target_piece is None:
+			return []
+		actor_pos = getattr(actor, "position", None)
+		target_pos = getattr(target_piece, "position", None)
+		ax = int(getattr(actor_pos, "x", -1)) if actor_pos is not None else -1
+		ay = int(getattr(actor_pos, "y", -1)) if actor_pos is not None else -1
+		tx = int(getattr(target_pos, "x", -1)) if target_pos is not None else -1
+		ty = int(getattr(target_pos, "y", -1)) if target_pos is not None else -1
+		if ax < 0 or ay < 0 or tx < 0 or ty < 0:
+			return []
+		spell_range = float(getattr(spell, "range", 0.0))
+		distance = ((ax - tx) ** 2 + (ay - ty) ** 2) ** 0.5
+		if distance > spell_range:
+			return []
+		return [{"x": tx, "y": ty, "text": "🎯"}]
 
 	def _build_runtime_trap_markers(self) -> list[dict[str, Any]]:
 		markers: list[dict[str, Any]] = []
@@ -2910,6 +3351,7 @@ class MainUI:
 			self.action_confirm_button.pack_forget()
 		self.action_ui_mode.set("")
 		self.action_spell_target_option_map = {}
+		self._refresh_board_view()
 
 	def _switch_action_mode(self, mode: str, body_container: ttk.Frame) -> None:
 		self._stop_action_move_point_pick()
@@ -2922,6 +3364,7 @@ class MainUI:
 		if self.action_confirm_button is not None:
 			self.action_confirm_button.pack(side="left", padx=(8, 0))
 		self._set_action_feedback("", True)
+		self._refresh_board_view()
 
 	def _rerender_attack_mode_if_needed(self) -> None:
 		if self._rendering_action_mode_body:
@@ -2934,6 +3377,7 @@ class MainUI:
 		for widget in container.winfo_children():
 			widget.destroy()
 		self._render_action_mode_body(container)
+		self._refresh_board_view()
 
 	def _refresh_custom_attack_preview(self) -> None:
 		self.action_custom_preview_var.set("")
@@ -2952,6 +3396,7 @@ class MainUI:
 		for widget in container.winfo_children():
 			widget.destroy()
 		self._render_action_mode_body(container)
+		self._refresh_board_view()
 
 	def _spell_display_name(self, spell: Any) -> str:
 		name = str(getattr(spell, "name", "法术"))
@@ -2982,17 +3427,6 @@ class MainUI:
 		if not callable(fetcher):
 			return ["法术A"], {}
 		spells = [s for s in self._coerce_piece_list(fetcher(caster)) if s is not None]
-		# 测试阶段：补齐完整法术池，避免因职业筛选导致调试缺失法术。
-		try:
-			for extra_spell in self._coerce_piece_list(SpellFactory.get_all_spells()):
-				if extra_spell is None:
-					continue
-				spell_id = int(getattr(extra_spell, "id", -1))
-				if any(int(getattr(s, "id", -2)) == spell_id for s in spells):
-					continue
-				spells.append(extra_spell)
-		except Exception:
-			pass
 		if not spells:
 			return ["法术A"], {}
 		option_map: dict[str, Any] = {}
@@ -3171,8 +3605,23 @@ class MainUI:
 		return None
 
 	def _handle_death_check_if_possible(self, env: Any, piece: Any) -> None:
+		if env is None or piece is None:
+			return
 		try:
-			if env is not None and callable(getattr(env, "handle_death_check", None)):
+			hp = int(getattr(piece, "health", 0))
+		except Exception:
+			hp = 0
+		if hp < 0:
+			try:
+				piece.get_accessor().set_health_to(0)
+			except Exception:
+				setattr(piece, "health", 0)
+			hp = 0
+		# 仅当 HP==0 才触发死亡检定（0 才是死亡；负数视为非法并夹到 0）。
+		if hp != 0:
+			return
+		try:
+			if callable(getattr(env, "handle_death_check", None)):
 				env.handle_death_check(piece)
 		except Exception:
 			return
@@ -3197,6 +3646,12 @@ class MainUI:
 		except Exception:
 			setattr(piece, "health", max(0, old_hp - damage))
 		new_hp = int(getattr(piece, "health", 0))
+		if new_hp < 0:
+			try:
+				piece.get_accessor().set_health_to(0)
+			except Exception:
+				setattr(piece, "health", 0)
+			new_hp = 0
 		real = max(0, old_hp - new_hp)
 		code = self._get_piece_short_code(piece)
 
@@ -3247,6 +3702,18 @@ class MainUI:
 		if not callable(step_func):
 			return
 
+		snapshot = getattr(env, "_ui_action_settings_snapshot", None)
+		if not isinstance(snapshot, dict) or not snapshot:
+			snapshot = self.action_settings_snapshot if isinstance(self.action_settings_snapshot, dict) else self._default_action_settings_snapshot()
+		attack_model = snapshot.get("attack_model", {}) if isinstance(snapshot, dict) else {}
+		enable_d20 = bool(attack_model.get("enable_d20", True))
+		hit_cfg = attack_model.get("hit", {}) if isinstance(attack_model.get("hit"), dict) else {}
+		magic_hit_cfg = attack_model.get("magic_hit", {}) if isinstance(attack_model.get("magic_hit"), dict) else {}
+		phy_dmg_cfg = attack_model.get("physical_damage", {}) if isinstance(attack_model.get("physical_damage"), dict) else {}
+		mag_dmg_cfg = attack_model.get("magic_damage", {}) if isinstance(attack_model.get("magic_damage"), dict) else {}
+		fail_on_1 = bool(hit_cfg.get("fail_on_1", True))
+		crit_on_20 = bool(hit_cfg.get("crit_on_20", True))
+
 		advantage_func = getattr(env, "calculate_advantage_value", None)
 		advantage_impl = callable(advantage_func)
 		adv_value = 0
@@ -3257,29 +3724,35 @@ class MainUI:
 				adv_value = 0
 
 		attack_name = "物理攻击" if attack_type == "物理攻击" else "普通法术攻击"
-		roll_value = int(attack_roll) if attack_roll is not None else -1
+		roll_value = int(attack_roll) if (attack_roll is not None and enable_d20) else (0 if not enable_d20 else -1)
 
 		if attack_type == "普通法术攻击":
+			bonus_flat = float(magic_hit_cfg.get("bonus_flat", 0.0) or 0.0)
+			coeff_int = float(magic_hit_cfg.get("coeff_intelligence", 1.0) or 1.0)
+			adv_coeff = float(magic_hit_cfg.get("coeff_advantage", 1.0) or 1.0)
+			def_attr = magic_hit_cfg.get("defense_modifier_attr", None)
+			def_base_coeff = float(magic_hit_cfg.get("defense_base_coeff", 1.0) or 1.0)
+			def_attr_coeff = float(magic_hit_cfg.get("defense_attr_coeff", 1.0) or 1.0)
+			def_flat_bonus = float(magic_hit_cfg.get("defense_flat_bonus", 0.0) or 0.0)
 			attack_part = int(step_func(int(getattr(attacker, "intelligence", 0))))
-			resist_part = int(getattr(target, "magic_resist", 0))
-			left_total = roll_value + attack_part + int(adv_value) if roll_value >= 0 else None
-			right_total = resist_part
-			symbol = ">" if (left_total is not None and left_total > right_total) else "<="
+			attack_score = (float(max(0, roll_value)) + bonus_flat + coeff_int * float(attack_part) + adv_coeff * float(adv_value)) if roll_value >= 0 else None
+			base_def = float(getattr(target, "magic_resist", 0))
+			attr_def = float(step_func(int(getattr(target, str(def_attr), 0)))) if def_attr not in (None, "", "none") else 0.0
+			defense_score = def_base_coeff * base_def + def_attr_coeff * attr_def + def_flat_bonus
+			symbol = ">" if (attack_score is not None and attack_score > defense_score) else "<="
 
-			if roll_value == 1:
+			if enable_d20 and roll_value == 1 and fail_on_1:
 				self.right_info_panel.append_content(
-					f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{attack_part}(智力)+{int(adv_value)}(优势值) {symbol} "
-					f"{resist_part}(法术豁免)；即 {left_total} {symbol} {right_total}，但天然1直接未命中"
+					f"\n[公式] {attack_name}命中判定：天然1直接未命中（roll=1）"
 				)
-			elif roll_value == 20:
+			elif enable_d20 and roll_value == 20 and crit_on_20:
 				self.right_info_panel.append_content(
-					f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{attack_part}(智力)+{int(adv_value)}(优势值) {symbol} "
-					f"{resist_part}(法术豁免)；即 {left_total} {symbol} {right_total}，天然20直接命中"
+					f"\n[公式] {attack_name}命中判定：天然20直接命中（roll=20）"
 				)
-			elif left_total is not None:
+			elif attack_score is not None:
 				self.right_info_panel.append_content(
-					f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{attack_part}(智力)+{int(adv_value)}(优势值) {symbol} "
-					f"{resist_part}(法术豁免)；即 {left_total} {symbol} {right_total}"
+					f"\n[公式] {attack_name}命中判定：{roll_value}(投掷)+{bonus_flat:.1f}(加值)+{coeff_int:.1f}*{attack_part}(智力修正)+{adv_coeff:.1f}*{adv_value:.0f}(优势) {symbol} "
+					f"{def_base_coeff:.1f}*{int(base_def)}(法抗)+{def_attr_coeff:.1f}*{int(attr_def)}(防御修正)+{def_flat_bonus:.1f}(加值)；即 {attack_score:.1f} {symbol} {defense_score:.1f}"
 				)
 			else:
 				self.right_info_panel.append_content(f"\n[公式] {attack_name}命中判定：未捕获到投掷值")
@@ -3287,40 +3760,53 @@ class MainUI:
 			if not advantage_impl:
 				self.right_info_panel.append_content("\n[公式] 优势值：未实现，按 0 处理")
 
-			base_damage = int(getattr(attacker, "magic_damage", 0))
-			if not is_hit:
-				self.right_info_panel.append_content(
-					f"\n[公式] 伤害计算：未命中，本次原始伤害=0；实际伤害=0"
-				)
+			resist_part = int(getattr(target, "magic_resist", 0))
+			base_from_piece = bool(mag_dmg_cfg.get("base_from_piece", True))
+			base_override = mag_dmg_cfg.get("base_override", None)
+			if base_from_piece:
+				base_damage = int(getattr(attacker, "magic_damage", 0))
+				base_label = "法伤"
 			else:
-				crit_text = " x2(暴击)" if roll_value == 20 else ""
+				try:
+					base_damage = int(float(base_override)) if base_override is not None else 0
+				except Exception:
+					base_damage = 0
+				base_label = "设定值"
+			if not is_hit:
+				self.right_info_panel.append_content(f"\n[公式] 伤害计算：未命中，本次原始伤害=0；实际伤害=0")
+			else:
+				crit_text = " x2(暴击)" if (enable_d20 and roll_value == 20 and crit_on_20) else ""
 				self.right_info_panel.append_content(
-					f"\n[公式] 伤害计算：原始伤害={base_damage}(法伤){crit_text}={raw_damage}；"
-					f"实际伤害=max(0, {raw_damage}-{resist_part})={real_damage}"
+					f"\n[公式] 伤害计算：原始伤害={base_damage}({base_label}){crit_text}={raw_damage}；实际伤害=max(0, {raw_damage}-{resist_part})={real_damage}"
 				)
 			return
 
+		bonus_flat = float(hit_cfg.get("bonus_flat", 0.0) or 0.0)
+		coeff_strength = float(hit_cfg.get("coeff_strength", 1.0) or 1.0)
+		adv_coeff = float(hit_cfg.get("coeff_advantage", 1.0) or 1.0)
+		def_attr = hit_cfg.get("defense_modifier_attr", "dexterity")
+		def_base_coeff = float(hit_cfg.get("defense_base_coeff", 1.0) or 1.0)
+		def_attr_coeff = float(hit_cfg.get("defense_attr_coeff", 1.0) or 1.0)
+		def_flat_bonus = float(hit_cfg.get("defense_flat_bonus", 0.0) or 0.0)
 		strength_part = int(step_func(int(getattr(attacker, "strength", 0))))
-		dex_part = int(step_func(int(getattr(target, "dexterity", 0))))
 		resist_part = int(getattr(target, "physical_resist", 0))
-		left_total = roll_value + strength_part + int(adv_value) if roll_value >= 0 else None
-		right_total = resist_part + dex_part
-		symbol = ">" if (left_total is not None and left_total > right_total) else "<="
+		attack_score = (float(max(0, roll_value)) + bonus_flat + coeff_strength * float(strength_part) + adv_coeff * float(adv_value)) if roll_value >= 0 else None
+		attr_def = float(step_func(int(getattr(target, str(def_attr), 0)))) if def_attr not in (None, "", "none") else 0.0
+		defense_score = def_base_coeff * float(resist_part) + def_attr_coeff * float(attr_def) + def_flat_bonus
+		symbol = ">" if (attack_score is not None and attack_score > defense_score) else "<="
 
-		if roll_value == 1:
+		if enable_d20 and roll_value == 1 and fail_on_1:
 			self.right_info_panel.append_content(
-				f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{strength_part}(力量)+{int(adv_value)}(优势值) {symbol} "
-				f"{resist_part}(物理豁免)+{dex_part}(敏捷)；即 {left_total} {symbol} {right_total}，但天然1直接未命中"
+				f"\n[公式] {attack_name}命中判定：天然1直接未命中（roll=1）"
 			)
-		elif roll_value == 20:
+		elif enable_d20 and roll_value == 20 and crit_on_20:
 			self.right_info_panel.append_content(
-				f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{strength_part}(力量)+{int(adv_value)}(优势值) {symbol} "
-				f"{resist_part}(物理豁免)+{dex_part}(敏捷)；即 {left_total} {symbol} {right_total}，天然20直接命中"
+				f"\n[公式] {attack_name}命中判定：天然20直接命中（roll=20）"
 			)
-		elif left_total is not None:
+		elif attack_score is not None:
 			self.right_info_panel.append_content(
-				f"\n[公式] {attack_name}命中判定：{roll_value}(投掷值)+{strength_part}(力量)+{int(adv_value)}(优势值) {symbol} "
-				f"{resist_part}(物理豁免)+{dex_part}(敏捷)；即 {left_total} {symbol} {right_total}"
+				f"\n[公式] {attack_name}命中判定：{roll_value}(投掷)+{bonus_flat:.1f}(加值)+{coeff_strength:.1f}*{strength_part}(力量修正)+{adv_coeff:.1f}*{adv_value:.0f}(优势) {symbol} "
+				f"{def_base_coeff:.1f}*{resist_part}(物抗)+{def_attr_coeff:.1f}*{int(attr_def)}(防御修正)+{def_flat_bonus:.1f}(加值)；即 {attack_score:.1f} {symbol} {defense_score:.1f}"
 			)
 		else:
 			self.right_info_panel.append_content(f"\n[公式] {attack_name}命中判定：未捕获到投掷值")
@@ -3328,15 +3814,25 @@ class MainUI:
 		if not advantage_impl:
 			self.right_info_panel.append_content("\n[公式] 优势值：未实现，按 0 处理")
 
-		base_damage = int(getattr(attacker, "physical_damage", 0))
+		base_from_piece = bool(phy_dmg_cfg.get("base_from_piece", True))
+		base_override = phy_dmg_cfg.get("base_override", None)
+		if base_from_piece:
+			base_damage = int(getattr(attacker, "physical_damage", 0))
+			base_label = "物伤"
+		else:
+			try:
+				base_damage = int(float(base_override)) if base_override is not None else 0
+			except Exception:
+				base_damage = 0
+			base_label = "设定值"
 		if not is_hit:
 			self.right_info_panel.append_content(
 				f"\n[公式] 伤害计算：未命中，本次原始伤害=0；实际伤害=0"
 			)
 		else:
-			crit_text = " x2(暴击)" if roll_value == 20 else ""
+			crit_text = " x2(暴击)" if (enable_d20 and roll_value == 20 and crit_on_20) else ""
 			self.right_info_panel.append_content(
-				f"\n[公式] 伤害计算：原始伤害={base_damage}(物伤){crit_text}={raw_damage}；"
+				f"\n[公式] 伤害计算：原始伤害={base_damage}({base_label}){crit_text}={raw_damage}；"
 				f"实际伤害=max(0, {raw_damage}-{resist_part})={real_damage}"
 			)
 
@@ -3344,17 +3840,9 @@ class MainUI:
 		env = self.controller.environment
 		if env is None:
 			return
-		if target_piece is not None and not bool(getattr(target_piece, "is_alive", True)):
+		if target_piece is not None and (not self._is_piece_alive_by_hp(target_piece)):
 			self.right_info_panel.append_content(f"\n棋子 {target_code} 已死亡")
-
-		p1_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player1", None), "pieces", [])))
-		p2_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player2", None), "pieces", [])))
-		if not (p1_alive and p2_alive):
-			winner = "玩家1" if p1_alive else ("玩家2" if p2_alive else "无人")
-			setattr(env, "is_game_over", True)
-			self.right_info_panel.append_content(f"\n游戏结束，胜者：{winner}")
-			if self.controller.runtime_source == "runtime_env":
-				self._show_game_over_reset_dialog()
+		self._check_and_announce_runtime_game_over(env, show_dialog=True)
 
 	def _render_action_mode_body(self, body_container: ttk.Frame) -> None:
 		self._rendering_action_mode_body = True
@@ -3576,7 +4064,7 @@ class MainUI:
 					return
 
 				target_piece.get_accessor().set_health_to(max(old_hp - custom_damage, 0))
-				if int(getattr(target_piece, "health", 0)) <= 0:
+				if int(getattr(target_piece, "health", 0)) == 0:
 					env.handle_death_check(target_piece)
 				self._append_runtime_action_log(
 					actor_code=self._get_piece_short_code(current_piece),
@@ -3605,6 +4093,18 @@ class MainUI:
 			attack_roll: int | None = None
 			raw_damage = 0
 			is_hit: bool | None = None
+			# 读取“行动设置（本局）”快照：若未应用则使用默认。
+			snapshot = getattr(env, "_ui_action_settings_snapshot", None)
+			if not isinstance(snapshot, dict) or not snapshot:
+				snapshot = self.action_settings_snapshot if isinstance(self.action_settings_snapshot, dict) else self._default_action_settings_snapshot()
+			attack_model = snapshot.get("attack_model", {}) if isinstance(snapshot, dict) else {}
+			enable_d20 = bool(attack_model.get("enable_d20", True))
+			hit_cfg = attack_model.get("hit", {}) if isinstance(attack_model.get("hit"), dict) else {}
+			magic_hit_cfg = attack_model.get("magic_hit", {}) if isinstance(attack_model.get("magic_hit"), dict) else {}
+			phy_dmg_cfg = attack_model.get("physical_damage", {}) if isinstance(attack_model.get("physical_damage"), dict) else {}
+			mag_dmg_cfg = attack_model.get("magic_damage", {}) if isinstance(attack_model.get("magic_damage"), dict) else {}
+			fail_on_1 = bool(hit_cfg.get("fail_on_1", True))
+			crit_on_20 = bool(hit_cfg.get("crit_on_20", True))
 
 			if attack_type == "物理攻击":
 				attack_context = AttackContext()
@@ -3637,26 +4137,39 @@ class MainUI:
 
 				attack_roll = int(captured_rolls[0]) if captured_rolls else None
 				raw_damage = int(getattr(attack_context, "damage_dealt", 0))
-				# 说明：伤害可能为 0（例如棋子物伤为 0），但仍可能“命中”。因此命中判定不能用 raw_damage>0。
+				# 说明：伤害可能为 0（例如基础伤害为 0），但仍可能“命中”。命中判定按行动设置公式计算。
 				try:
 					step_func = getattr(env, "step_modified_func", None)
 					advantage_func = getattr(env, "calculate_advantage_value", None)
-					if attack_roll is None or (not callable(step_func)):
+					if not callable(step_func):
 						is_hit = None
-					elif attack_roll == 1:
-						is_hit = False
-					elif attack_roll == 20:
-						is_hit = True
 					else:
-						adv_value = 0
+						roll_val = int(attack_roll or 0) if enable_d20 else 0
+						bonus_flat = float(hit_cfg.get("bonus_flat", 0.0) or 0.0)
+						coeff_strength = float(hit_cfg.get("coeff_strength", 1.0) or 1.0)
+						adv_coeff = float(hit_cfg.get("coeff_dexterity", 1.0) or 1.0)
+						def_attr = hit_cfg.get("defense_modifier_attr", "dexterity")
+						def_base_coeff = float(hit_cfg.get("defense_base_coeff", 1.0) or 1.0)
+						def_attr_coeff = float(hit_cfg.get("defense_attr_coeff", 1.0) or 1.0)
+						def_flat_bonus = float(hit_cfg.get("defense_flat_bonus", 0.0) or 0.0)
+						adv_value = 0.0
 						if callable(advantage_func):
 							try:
-								adv_value = int(advantage_func(current_piece, target_piece))
+								adv_value = float(advantage_func(current_piece, target_piece))
 							except Exception:
-								adv_value = 0
-						attack_throw = int(attack_roll) + int(step_func(int(getattr(current_piece, "strength", 0)))) + int(adv_value)
-						defense_value = int(getattr(target_piece, "physical_resist", 0)) + int(step_func(int(getattr(target_piece, "dexterity", 0))))
-						is_hit = bool(attack_throw > defense_value)
+								adv_value = 0.0
+						if enable_d20 and roll_val == 1 and fail_on_1:
+							is_hit = False
+						elif enable_d20 and roll_val == 20 and crit_on_20:
+							is_hit = True
+						else:
+							attack_score = float(roll_val) + bonus_flat + coeff_strength * float(step_func(int(getattr(current_piece, "strength", 0)))) + adv_coeff * float(adv_value)
+							base_def = float(getattr(target_piece, "physical_resist", 0))
+							attr_def = 0.0
+							if def_attr not in (None, "", "none"):
+								attr_def = float(step_func(int(getattr(target_piece, str(def_attr), 0))))
+							defense_score = def_base_coeff * base_def + def_attr_coeff * attr_def + def_flat_bonus
+							is_hit = bool(attack_score > defense_score)
 				except Exception:
 					is_hit = None
 			else:
@@ -3664,34 +4177,67 @@ class MainUI:
 				if not callable(step_func):
 					self._set_action_feedback("行动失败：普通法术攻击缺少规则函数", False)
 					return
-
 				advantage_func = getattr(env, "calculate_advantage_value", None)
-				adv_value = 0
+				adv_value = 0.0
 				if callable(advantage_func):
 					try:
-						adv_value = int(advantage_func(current_piece, target_piece))
+						adv_value = float(advantage_func(current_piece, target_piece))
 					except Exception:
-						adv_value = 0
+						adv_value = 0.0
 
-				attack_roll = int(getattr(env, "roll_dice")(1, 20))
-				if attack_roll == 1:
+				roll_val = 0
+				if enable_d20 and callable(getattr(env, "roll_dice", None)):
+					roll_val = int(getattr(env, "roll_dice")(1, 20))
+				attack_roll = roll_val if enable_d20 else None
+
+				bonus_flat = float(magic_hit_cfg.get("bonus_flat", 0.0) or 0.0)
+				coeff_int = float(magic_hit_cfg.get("coeff_intelligence", 1.0) or 1.0)
+				adv_coeff = float(magic_hit_cfg.get("coeff_advantage", 1.0) or 1.0)
+				def_attr = magic_hit_cfg.get("defense_modifier_attr", None)
+				def_base_coeff = float(magic_hit_cfg.get("defense_base_coeff", 1.0) or 1.0)
+				def_attr_coeff = float(magic_hit_cfg.get("defense_attr_coeff", 1.0) or 1.0)
+				def_flat_bonus = float(magic_hit_cfg.get("defense_flat_bonus", 0.0) or 0.0)
+
+				is_critical = False
+				if enable_d20 and roll_val == 1 and fail_on_1:
 					is_hit = False
-					is_critical = False
-				elif attack_roll == 20:
+				elif enable_d20 and roll_val == 20 and crit_on_20:
 					is_hit = True
 					is_critical = True
 				else:
-					attack_throw = attack_roll + int(step_func(int(getattr(current_piece, "intelligence", 0)))) + int(adv_value)
-					defense_value = int(getattr(target_piece, "magic_resist", 0))
-					is_hit = bool(attack_throw > defense_value)
-					is_critical = False
+					attack_score = float(roll_val if enable_d20 else 0) + bonus_flat + coeff_int * float(step_func(int(getattr(current_piece, "intelligence", 0)))) + adv_coeff * float(adv_value)
+					base_def = float(getattr(target_piece, "magic_resist", 0))
+					attr_def = 0.0
+					if def_attr not in (None, "", "none"):
+						attr_def = float(step_func(int(getattr(target_piece, str(def_attr), 0))))
+					defense_score = def_base_coeff * base_def + def_attr_coeff * attr_def + def_flat_bonus
+					is_hit = bool(attack_score > defense_score)
 
 				if is_hit:
-					raw_damage = int(getattr(current_piece, "magic_damage", 0))
+					base_from_piece = bool(mag_dmg_cfg.get("base_from_piece", True))
+					base_override = mag_dmg_cfg.get("base_override", None)
+					flat_bonus = float(mag_dmg_cfg.get("flat_bonus", 0.0) or 0.0)
+					if base_from_piece:
+						base = float(getattr(current_piece, "magic_damage", 0))
+					else:
+						try:
+							base = float(base_override) if base_override is not None else 0.0
+						except Exception:
+							base = 0.0
+					damage = max(0.0, base + flat_bonus)
 					if is_critical:
-						raw_damage *= 2
-					target_piece.receive_damage(raw_damage, "magic")
-					if int(getattr(target_piece, "health", 0)) <= 0:
+						damage *= 2
+					int_damage = int(round(damage))
+					raw_damage = int_damage
+					target_piece.receive_damage(int_damage, "magic")
+					new_hp_tmp = int(getattr(target_piece, "health", 0))
+					if new_hp_tmp < 0:
+						try:
+							target_piece.get_accessor().set_health_to(0)
+						except Exception:
+							setattr(target_piece, "health", 0)
+						new_hp_tmp = 0
+					if new_hp_tmp == 0:
 						env.handle_death_check(target_piece)
 
 				current_piece.get_accessor().change_action_points_by(-1)
@@ -3910,7 +4456,13 @@ class MainUI:
 					self.right_info_panel.append_content(
 						f"\n[公式] 结算：{spell_name} 为 {code} 恢复 {heal} 点生命（HP {old_hp}->{new_hp}）"
 					)
-				if new_hp <= 0:
+				if new_hp < 0:
+					try:
+						p.get_accessor().set_health_to(0)
+					except Exception:
+						setattr(p, "health", 0)
+					new_hp = 0
+				if new_hp == 0:
 					self._handle_death_check_if_possible(env, p)
 
 			summary_targets = ",".join(target_codes) if target_codes else "无"
@@ -4009,31 +4561,15 @@ class MainUI:
 	def _on_click_piece_action(self) -> None:
 		"""点击“棋子行动”后，在可变区显示行动编辑面板。"""
 		self.right_top_composite_panel.clear_variable_area()
+		self.action_panel_status_label = None
 
 		container = ttk.Frame(self.right_top_composite_panel.variable_frame)
 		container.pack(fill="both", expand=True)
 		container.columnconfigure(0, weight=1)
 
-		if self.controller.runtime_source == "runtime_env" and self.controller.environment is not None:
-			piece = self._get_runtime_current_piece(self.controller.environment)
-			if piece is not None:
-				piece_code = self._get_piece_short_code(piece)
-				pos = getattr(piece, "position", None)
-				px = int(getattr(pos, "x", -1)) if pos is not None else -1
-				py = int(getattr(pos, "y", -1)) if pos is not None else -1
-				ap = int(getattr(piece, "action_points", 0))
-				max_ap = int(getattr(piece, "max_action_points", ap))
-				sp = int(getattr(piece, "spell_slots", 0))
-				max_sp = int(getattr(piece, "max_spell_slots", sp))
-				status = (
-					f"当前行动棋子: {piece_code} | 坐标({px}, {py})"
-					f" | 行动{ap}/{max_ap} | 法术{sp}/{max_sp}"
-				)
-			else:
-				status = "当前行动棋子: 无"
-		else:
-			status = "当前模式暂不提供行动时段驱动"
-		ttk.Label(container, text=status, foreground="#374151").grid(row=0, column=0, sticky="w", pady=(0, 6))
+		self.action_panel_status_label = ttk.Label(container, text="", foreground="#374151")
+		self.action_panel_status_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
+		self._refresh_piece_action_status_line()
 
 		row1 = ttk.Frame(container)
 		row1.grid(row=1, column=0, sticky="ew", pady=(0, 6))
@@ -4944,7 +5480,7 @@ class MainUI:
 		self.root.after(5000, _clear)
 
 	def _apply_action_attribute_changes(self) -> None:
-		"""应用行动属性（本局临时生效）：仅保存配置，不改后端规则。"""
+		"""应用行动属性（本局临时生效）：运行时猴子补丁覆写 env 公式，不改后端文件。"""
 		try:
 			snapshot = self._collect_action_settings_snapshot_from_vars()
 			self.action_settings_snapshot = snapshot
@@ -4953,6 +5489,7 @@ class MainUI:
 				self.controller.apply_environment_config({"action_settings": snapshot})
 			except Exception:
 				pass
+			self._apply_action_settings_to_runtime_environment(snapshot)
 			self.right_info_panel.append_content("\n[UI] 行动属性已应用（本局临时生效）：攻击模型 + 法术数值覆盖")
 			self._show_action_apply_feedback("应用成功")
 		except Exception as e:
@@ -4967,7 +5504,200 @@ class MainUI:
 				var.set(False)
 			except Exception:
 				pass
+		self._apply_action_settings_to_runtime_environment(self.action_settings_snapshot)
 		self._show_action_apply_feedback("已恢复默认")
+
+	def _apply_action_settings_to_runtime_environment(self, snapshot: dict[str, Any]) -> None:
+		"""将行动属性设置注入到 runtime env（仅本局内存生效）。"""
+		if self.controller.runtime_source != "runtime_env":
+			return
+		env = getattr(self.controller, "environment", None)
+		if env is None:
+			return
+		# 存到 env 上，供钩子读取。
+		setattr(env, "_ui_action_settings_snapshot", snapshot if isinstance(snapshot, dict) else {})
+		if bool(getattr(env, "_ui_action_settings_hook_installed", False)):
+			return
+		setattr(env, "_ui_action_settings_hook_installed", True)
+		default_snapshot = self._default_action_settings_snapshot()
+
+		orig_execute_attack = getattr(env, "execute_attack", None)
+		orig_get_available_spells = getattr(env, "get_available_spells", None)
+		if callable(orig_execute_attack):
+			setattr(env, "_ui_orig_execute_attack", orig_execute_attack)
+		if callable(orig_get_available_spells):
+			setattr(env, "_ui_orig_get_available_spells", orig_get_available_spells)
+
+		def _get_snapshot() -> dict[str, Any]:
+			snap = getattr(env, "_ui_action_settings_snapshot", None)
+			return snap if isinstance(snap, dict) else default_snapshot
+
+		def _step_mod(value: Any) -> int:
+			step_func = getattr(env, "step_modified_func", None)
+			if callable(step_func):
+				try:
+					return int(step_func(int(value)))
+				except Exception:
+					return 0
+			return 0
+
+		def _adv_value(attacker: Any, target: Any) -> float:
+			adv_func = getattr(env, "calculate_advantage_value", None)
+			if callable(adv_func):
+				try:
+					return float(adv_func(attacker, target))
+				except Exception:
+					return 0.0
+			return 0.0
+
+		def execute_attack_hook(attack_context: Any):
+			# 仅覆盖“物理攻击”的命中与伤害；其余逻辑保持与原 env 一致（AP、范围等）。
+			try:
+				attacker = getattr(attack_context, "attacker", None)
+				target = getattr(attack_context, "target", None)
+				if attacker is None or target is None:
+					return
+				if int(getattr(attacker, "action_points", 0)) <= 0:
+					return
+				if not bool(getattr(attacker, "is_alive", True)) or int(getattr(attacker, "health", 0)) <= 0:
+					return
+				if not bool(getattr(target, "is_alive", True)) or int(getattr(target, "health", 0)) <= 0:
+					return
+				if not bool(getattr(env, "is_in_attack_range", lambda a, t: True)(attacker, target)):
+					return
+
+				snap = _get_snapshot()
+				attack_model = snap.get("attack_model", {}) if isinstance(snap, dict) else {}
+				enable_d20 = bool(attack_model.get("enable_d20", True))
+				hit_cfg = attack_model.get("hit", {}) if isinstance(attack_model.get("hit"), dict) else {}
+				dmg_cfg = attack_model.get("physical_damage", {}) if isinstance(attack_model.get("physical_damage"), dict) else {}
+
+				roll_value = 0
+				if enable_d20 and callable(getattr(env, "roll_dice", None)):
+					try:
+						roll_value = int(getattr(env, "roll_dice")(1, 20))
+					except Exception:
+						roll_value = 0
+
+				fail_on_1 = bool(hit_cfg.get("fail_on_1", True))
+				crit_on_20 = bool(hit_cfg.get("crit_on_20", True))
+				bonus_flat = float(hit_cfg.get("bonus_flat", 0.0) or 0.0)
+				coeff_strength = float(hit_cfg.get("coeff_strength", 1.0) or 1.0)
+				adv_coeff = float(hit_cfg.get("coeff_dexterity", 1.0) or 1.0)
+
+				def_attr = hit_cfg.get("defense_modifier_attr", "dexterity")
+				def_base_coeff = float(hit_cfg.get("defense_base_coeff", 1.0) or 1.0)
+				def_attr_coeff = float(hit_cfg.get("defense_attr_coeff", 1.0) or 1.0)
+				def_flat_bonus = float(hit_cfg.get("defense_flat_bonus", 0.0) or 0.0)
+
+				is_critical = False
+				if enable_d20 and roll_value == 1 and fail_on_1:
+					is_hit = False
+				elif enable_d20 and roll_value == 20 and crit_on_20:
+					is_hit = True
+					is_critical = True
+				else:
+					adv = _adv_value(attacker, target)
+					attack_score = float(roll_value) + bonus_flat + coeff_strength * float(_step_mod(getattr(attacker, "strength", 0))) + adv_coeff * float(adv)
+					base_def = float(getattr(target, "physical_resist", 0))
+					attr_def = 0.0
+					if def_attr not in (None, "", "none"):
+						attr_def = float(_step_mod(getattr(target, str(def_attr), 0)))
+					defense_score = def_base_coeff * base_def + def_attr_coeff * attr_def + def_flat_bonus
+					is_hit = bool(attack_score > defense_score)
+
+				# 命中才结算伤害
+				setattr(attack_context, "damage_dealt", 0)
+				if is_hit:
+					base_from_piece = bool(dmg_cfg.get("base_from_piece", True))
+					base_override = dmg_cfg.get("base_override", None)
+					flat_bonus = float(dmg_cfg.get("flat_bonus", 0.0) or 0.0)
+					if base_from_piece:
+						base = float(getattr(attacker, "physical_damage", 0))
+					else:
+						try:
+							base = float(base_override) if base_override is not None else 0.0
+						except Exception:
+							base = 0.0
+					damage = max(0, base + flat_bonus)
+					if is_critical:
+						damage *= 2
+					int_damage = int(round(damage))
+					try:
+						target.receive_damage(int_damage, "physical")
+					except Exception:
+						try:
+							old_hp = int(getattr(target, "health", 0))
+							setattr(target, "health", old_hp - int_damage)
+						except Exception:
+							pass
+					# 夹到 0，避免出现负血。
+					try:
+						cur_hp = int(getattr(target, "health", 0))
+					except Exception:
+						cur_hp = 0
+					if cur_hp < 0:
+						try:
+							target.get_accessor().set_health_to(0)
+						except Exception:
+							setattr(target, "health", 0)
+						cur_hp = 0
+					setattr(attack_context, "damage_dealt", int_damage)
+					if cur_hp == 0 and callable(getattr(env, "handle_death_check", None)):
+						env.handle_death_check(target)
+
+				# 消耗 AP
+				try:
+					attacker.get_accessor().change_action_points_by(-1)
+				except Exception:
+					setattr(attacker, "action_points", int(getattr(attacker, "action_points", 0)) - 1)
+			except Exception:
+				# 回退：若 hook 出错，尽量调用原实现。
+				orig = getattr(env, "_ui_orig_execute_attack", None)
+				if callable(orig):
+					return orig(attack_context)
+				return
+
+		def get_available_spells_hook(piece: Any = None):
+			orig = getattr(env, "_ui_orig_get_available_spells", None)
+			if not callable(orig):
+				return []
+			spells = [s for s in self._coerce_piece_list(orig(piece)) if s is not None]
+			snap = _get_snapshot()
+			overrides = snap.get("spell_overrides", {}) if isinstance(snap, dict) else {}
+			if not isinstance(overrides, dict) or not overrides:
+				return spells
+			out: list[Any] = []
+			for spell in spells:
+				sid = getattr(spell, "id", None)
+				key1 = str(sid) if sid is not None else ""
+				override = overrides.get(key1) or overrides.get(sid)
+				if not isinstance(override, dict):
+					out.append(spell)
+					continue
+				try:
+					new_spell = copy.copy(spell)
+				except Exception:
+					new_spell = spell
+				for k, attr_name in (
+					("base_value", "base_value"),
+					("range", "range"),
+					("area_radius", "area_radius"),
+					("spell_cost", "spell_cost"),
+					("base_lifespan", "base_lifespan"),
+				):
+					if k not in override:
+						continue
+					try:
+						setattr(new_spell, attr_name, int(float(override.get(k))))
+					except Exception:
+						pass
+				out.append(new_spell)
+			return out
+
+		# 安装 hook
+		setattr(env, "execute_attack", execute_attack_hook)
+		setattr(env, "get_available_spells", get_available_spells_hook)
 
 	def _build_attribute_action_page(self, content: ttk.LabelFrame) -> None:
 		"""构建行动属性页：仅用于调参（已实现、非自定义行动），先做 UI 骨架。"""
@@ -6033,6 +6763,16 @@ class MainUI:
 
 	def _get_piece_row_values(self, slot_key: str, runtime_map: dict[str, Any], mock_map: dict[str, int]) -> dict[str, str]:
 		if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
+			fixed_positions: dict[str, tuple[int, int]] = {
+				"p1_1": (3, 8),
+				"p1_2": (8, 3),
+				"p1_3": (17, 4),
+				"p2_1": (16, 11),
+				"p2_2": (11, 16),
+				"p2_3": (2, 15),
+			}
+			px, py = fixed_positions.get(slot_key, (0, 0))
+			px, py = self._clamp_piece_position(px, py)
 			if self._is_profession_mode():
 				default_cfg = {
 					"hp": "-",
@@ -6051,29 +6791,29 @@ class MainUI:
 					"spell_slots": "-",
 					"max_spell_slots": "-",
 					"movement": "-",
-					"pos_x": "0",
-					"pos_y": "0",
+					"pos_x": str(px),
+					"pos_y": str(py),
 				}
 			else:
 				default_cfg = {
-					"hp": "-",
+					"hp": "",
 					"profession": "自定义",
 					"weapon": "自定义",
 					"armor": "无甲",
 					"strength": "10",
 					"dexterity": "10",
 					"intelligence": "10",
-					"physical_resist": "6",
-					"magic_resist": "6",
-					"physical_damage": "6",
-					"magic_damage": "6",
+					"physical_resist": "15",
+					"magic_resist": "13",
+					"physical_damage": "18",
+					"magic_damage": "0",
 					"action_points": "2",
 					"max_action_points": "2",
 					"spell_slots": "2",
 					"max_spell_slots": "2",
-					"movement": "10",
-					"pos_x": "0",
-					"pos_y": "0",
+					"movement": "25",
+					"pos_x": str(px),
+					"pos_y": str(py),
 				}
 			cfg = self.runtime_piece_init_config.get(slot_key, {})
 			for key, val in cfg.items():
@@ -6219,7 +6959,11 @@ class MainUI:
 			"pos_y": "Y坐标",
 		}
 		if field == "hp" and allow_unset_hp and value in ("", "-", "-1"):
-			return "-", None
+			return "", None
+		if field == "hp" and allow_unset_hp:
+			# 初始化窗口：不自动修正到边界值，保留原始输入，让应用时可以标红并给出简要提示。
+			_ = value
+			return value, None
 
 		if field in ("movement",):
 			parsed = self._safe_float(value, -99999.0)
@@ -6488,8 +7232,27 @@ class MainUI:
 				if hp_raw in ("", "-", "-1"):
 					continue
 				hp_value = self._safe_int(hp_raw, -1)
-				if hp_value <= 0:
+				if hp_value < 0:
+					slot_name = f"player{slot_key[1]}-{slot_key[-1]}"
+					self._mark_attribute_field_error(slot_key, "hp")
+					self._show_attribute_warning_feedback(f"{slot_name} 的血量不能小于 0")
+					return
+				if hp_value == 0:
 					continue
+				if (
+					self.attribute_settings_force_init_mode
+					and self._is_runtime_selected_source()
+					and (not self._is_profession_mode())
+					and self._normalize_selected_source_value(self.selected_source) == "runtime_custom"
+				):
+					strength_raw = str(vars_dict.get("strength").get()).strip() if vars_dict.get("strength") is not None else "10"
+					strength = self._safe_int(strength_raw, 10)
+					max_hp = int(200)
+					if int(hp_value) > int(max_hp):
+						slot_name = f"player{slot_key[1]}-{slot_key[-1]}"
+						self._mark_attribute_field_error(slot_key, "hp")
+						self._show_attribute_warning_feedback(f"{slot_name} 的血量不能超过上限 ({max_hp})")
+						return
 
 			x = self._safe_int(vars_dict["pos_x"].get(), -1)
 			y = self._safe_int(vars_dict["pos_y"].get(), -1)
@@ -6530,8 +7293,13 @@ class MainUI:
 						f"当前场上未有有效棋子！请为双方至少各一个棋子分配天赋（力量/敏捷/智力，且总和≤{int(talent_cap)}）"
 					)
 					return
-				self._mark_attribute_field_error("p1_1", "hp")
-				self._mark_attribute_field_error("p2_1", "hp")
+				for sk in ("p1_1", "p2_1"):
+					vars_dict = self.attribute_piece_vars.get(sk) or {}
+					hp_raw = str(vars_dict.get("hp").get()).strip() if vars_dict.get("hp") is not None else ""
+					if hp_raw in ("", "-", "-1"):
+						self._mark_hp_placeholder_error(sk)
+					else:
+						self._mark_attribute_field_error(sk, "hp")
 				self._show_attribute_warning_feedback("当前场上未有有效棋子！请设置双方至少各一个棋子的血量")
 				return
 
@@ -6591,8 +7359,8 @@ class MainUI:
 					self._safe_int(vars_dict["pos_x"].get(), 0),
 					self._safe_int(vars_dict["pos_y"].get(), 0),
 				)
-				piece.health = self._safe_int(vars_dict["hp"].get(), int(getattr(piece, "health", 0)))
-				piece.is_alive = bool(piece.health > 0)
+				piece.health = max(0, self._safe_int(vars_dict["hp"].get(), int(getattr(piece, "health", 0))))
+				piece.is_alive = bool(int(getattr(piece, "health", 0)) > 0)
 				piece.strength = self._safe_int(vars_dict["strength"].get(), int(getattr(piece, "strength", 0)))
 				piece.dexterity = self._safe_int(vars_dict["dexterity"].get(), int(getattr(piece, "dexterity", 0)))
 				piece.intelligence = self._safe_int(vars_dict["intelligence"].get(), int(getattr(piece, "intelligence", 0)))
@@ -6695,6 +7463,9 @@ class MainUI:
 
 		self._refresh_piece_cards()
 		self._refresh_board_view()
+		# 手动应用属性可能直接导致某一方全灭（例如 0HP vs 50HP），这里主动检查胜负。
+		if self.controller.runtime_source == "runtime_env" and self.controller.environment is not None:
+			self._check_and_announce_runtime_game_over(self.controller.environment, show_dialog=True)
 		self.right_info_panel.append_content(f"\n[UI] 棋子属性已应用（本局临时生效），影响棋子数: {applied_count}")
 		self._show_attribute_apply_feedback("应用成功")
 
@@ -6747,6 +7518,7 @@ class MainUI:
 		self.attribute_piece_vars = {}
 		self.attribute_piece_entries = {}
 		self.attribute_piece_last_edit_tick = {}
+		self.attribute_piece_hp_hint_widgets = {}
 
 		enabled_map: dict[str, bool] = {}
 		for slot_key in slot_keys:
@@ -6893,16 +7665,54 @@ class MainUI:
 					else:
 						if self._is_profession_mode() and field in derived_fields:
 							state = "disabled"
-						entry = tk.Entry(
-							table,
-							textvariable=var,
-							width=9,
-							state=state,
-							fg="#111111",
-							disabledforeground="#9ca3af",
-						)
-						entry.grid(row=field_row, column=col_idx, sticky="ew", padx=(0, 6), pady=3)
-						widget = entry
+						if (
+							field == "hp"
+							and self.attribute_settings_force_init_mode
+							and self._normalize_selected_source_value(self.selected_source) == "runtime_custom"
+							and not self._is_profession_mode()
+						):
+							cell = ttk.Frame(table)
+							cell.grid(row=field_row, column=col_idx, sticky="ew", padx=(0, 6), pady=3)
+							cell.columnconfigure(0, weight=1)
+							entry = tk.Entry(
+								cell,
+								textvariable=var,
+								width=6,
+								state=state,
+								fg="#111111",
+								disabledforeground="#9ca3af",
+							)
+							entry.grid(row=0, column=0, sticky="ew")
+
+							# placeholder：覆盖在 Entry 内部，但不写入 Entry 内容。
+							try:
+								entry_bg = str(entry.cget("background"))
+							except Exception:
+								entry_bg = "#ffffff"
+							overlay = tk.Frame(cell, bg=entry_bg, highlightthickness=0, bd=0)
+							dash_label = tk.Label(overlay, text="-", fg="#111111", bg=entry_bg)
+							hint_label = tk.Label(overlay, text="", fg="#9ca3af", bg=entry_bg)
+							dash_label.pack(side="left")
+							hint_label.pack(side="left")
+							# 默认先隐藏，交给 _refresh_custom_init_hp_hint 控制显示。
+							overlay.place_forget()
+							# 点击 placeholder 时也能聚焦输入框。
+							overlay.bind("<Button-1>", lambda _e, ent=entry: ent.focus_set())
+							dash_label.bind("<Button-1>", lambda _e, ent=entry: ent.focus_set())
+							hint_label.bind("<Button-1>", lambda _e, ent=entry: ent.focus_set())
+							self.attribute_piece_hp_hint_widgets[slot_key] = (entry, overlay, dash_label, hint_label)
+							widget = entry
+						else:
+							entry = tk.Entry(
+								table,
+								textvariable=var,
+								width=9,
+								state=state,
+								fg="#111111",
+								disabledforeground="#9ca3af",
+							)
+							entry.grid(row=field_row, column=col_idx, sticky="ew", padx=(0, 6), pady=3)
+							widget = entry
 					self.attribute_piece_vars[slot_key][field] = var
 					self.attribute_piece_entries[slot_key][field] = widget
 
@@ -6920,15 +7730,18 @@ class MainUI:
 				highlight=highlight,
 			)
 			row_cursor += 1
-
 		for slot_key in slot_keys:
 			if self._is_profession_mode():
 				self._update_profession_display_and_presets(slot_key)
 			else:
-				self._update_custom_mode_equipment_presets(
-					slot_key,
-					update_stats=bool(self.attribute_settings_force_init_mode and self._is_runtime_selected_source()),
-				)
+				# 注意：初始化窗口的 custom 默认战斗数值是硬编码写入 cfg 的，不应再被装备预设覆盖。
+				self._update_custom_mode_equipment_presets(slot_key, update_stats=False)
+			if (
+				self.attribute_settings_force_init_mode
+				and self._normalize_selected_source_value(self.selected_source) == "runtime_custom"
+				and not self._is_profession_mode()
+			):
+				self._refresh_custom_init_hp_hint(slot_key)
 
 		if self.attribute_settings_force_init_mode and self._is_runtime_selected_source():
 			cap = self._get_talent_total_cap() if self._is_profession_mode() else None
@@ -6958,6 +7771,13 @@ class MainUI:
 		button_row.grid(row=2, column=0, sticky="e", pady=(10, 0))
 		self.attribute_piece_apply_status_label = ttk.Label(button_row, text="", foreground="#059669")
 		self.attribute_piece_apply_status_label.pack(side="right", padx=(0, 8))
+		if self.attribute_settings_force_init_mode and self._normalize_selected_source_value(self.selected_source) in (
+			"runtime_custom",
+			"runtime_profession",
+		):
+			ttk.Button(button_row, text="一键开始", command=self._one_click_fill_custom_init).pack(
+				side="right", padx=(0, 8)
+			)
 		ttk.Button(button_row, text="应用", command=self._apply_piece_attribute_changes).pack(side="right")
 
 		self.attribute_piece_warning_label = ttk.Label(wrapper, text="", foreground="#b45309")
@@ -7025,6 +7845,8 @@ class MainUI:
 			self.action_spell_point_y_var.set("")
 			self.action_spell_option_map = {}
 			self.action_spell_target_option_map = {}
+			self.action_panel_status_label = None
+			self.game_over_message_shown = False
 			self.left_board_panel.reset_board_state()
 			self._refresh_piece_cards()
 			choice = self._show_source_selection_dialog("重置后：选择数据源")
@@ -7042,6 +7864,7 @@ class MainUI:
 
 	def _on_event_game_loaded(self, event) -> None:
 		self.runtime_trap_effects = []
+		self.game_over_message_shown = False
 		self.right_info_panel.append_content(
 			f"\n[EVENT] GAME_LOADED source={event.payload.get('source')} mode={event.payload.get('mode')}"
 		)
@@ -7057,12 +7880,15 @@ class MainUI:
 		)
 
 	def _on_event_game_over(self, _event) -> None:
+		if bool(getattr(self, "game_over_message_shown", False)):
+			return
 		env = self.controller.environment
 		winner = "未知"
 		if env is not None:
 			p1_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player1", None), "pieces", [])))
 			p2_alive = any(bool(getattr(p, "is_alive", False)) for p in self._coerce_piece_list(getattr(getattr(env, "player2", None), "pieces", [])))
 			winner = "玩家1" if p1_alive else ("玩家2" if p2_alive else "无人")
+		self.game_over_message_shown = True
 		self.right_info_panel.append_content(f"\nGAME_OVER，胜者：{winner}")
 
 	def _on_click_initialize(self) -> None:
