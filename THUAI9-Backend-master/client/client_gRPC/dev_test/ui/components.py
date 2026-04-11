@@ -49,11 +49,41 @@ class InfoPanel(ttk.LabelFrame):
 		self._tag_player = "log_player"
 		self._tag_round = "log_round"
 		self._tag_important = "log_important"
+
+		# 逻辑类别（用于过滤/开关）。
+		self._category_default = "default"
+		self._category_system = "system"
+		self._category_player = "player"
+		self._category_round = "round"
+		self._category_important = "important"
+		self._category_to_tag = {
+			self._category_default: self._tag_default,
+			self._category_system: self._tag_system,
+			self._category_player: self._tag_player,
+			self._category_round: self._tag_round,
+			self._category_important: self._tag_important,
+		}
+		self._category_visible: dict[str, bool] = {
+			self._category_default: True,
+			self._category_system: True,
+			self._category_player: True,
+			self._category_round: True,
+			self._category_important: True,
+		}
+		# 记录已输出的行，便于动态切换过滤时重绘。
+		self._line_buffer: list[tuple[str, str]] = []
 		self.text.tag_configure(self._tag_default, foreground="#111111")
 		self.text.tag_configure(self._tag_system, foreground="#6b7280")
 		self.text.tag_configure(self._tag_player, foreground="#111111")
 		self.text.tag_configure(self._tag_round, foreground="#f97316")
 		self.text.tag_configure(self._tag_important, foreground="#dc2626")
+		self._tag_colors: dict[str, str] = {
+			self._tag_default: "#111111",
+			self._tag_system: "#6b7280",
+			self._tag_player: "#111111",
+			self._tag_round: "#f97316",
+			self._tag_important: "#dc2626",
+		}
 
 		self.text.pack(side="left", fill="both", expand=True)
 		self.scrollbar.pack(side="right", fill="y")
@@ -63,40 +93,89 @@ class InfoPanel(ttk.LabelFrame):
 
 	def set_content(self, content: str) -> None:
 		"""覆盖式写入内容，用于刷新展示文本。"""
-		self.set_readonly(False)
-		self.text.delete("1.0", "end")
-		self._insert_colored(content)
-		self.set_readonly(True)
+		self._line_buffer = []
+		self._push_to_buffer(content)
+		self._redraw_from_buffer()
 
 	def append_content(self, content: str) -> None:
 		"""追加内容，用于持续输出日志或状态流。"""
+		# 先入缓冲，再按可见性选择性写入。
+		new_lines = self._split_lines_with_category(content)
+		self._line_buffer.extend(new_lines)
+		if any(self._category_visible.get(cat, True) for _line, cat in new_lines):
+			self.set_readonly(False)
+			for line, category in new_lines:
+				if not self._category_visible.get(category, True):
+					continue
+				tag = self._category_to_tag.get(category, self._tag_default)
+				self.text.insert("end", line, (tag,))
+			self.text.see("end")
+			self.set_readonly(True)
+
+	def set_category_visibility(self, visibility: dict[str, bool]) -> None:
+		"""设置类别的显示/隐藏并重绘。
+
+		visibility 的 key 约定：default/system/player/round/important
+		"""
+		for key, value in visibility.items():
+			if key in self._category_visible:
+				self._category_visible[key] = bool(value)
+		self._redraw_from_buffer()
+
+	def set_category_colors(self, colors: dict[str, str]) -> None:
+		"""设置类别颜色（Text tag 的 foreground）。
+
+		colors 的 key 约定：default/system/player/round/important
+		value 为可被 Tk 识别的颜色（建议 #RRGGBB）。
+		"""
+		for category, color in colors.items():
+			if category not in self._category_to_tag:
+				continue
+			tag = self._category_to_tag[category]
+			try:
+				self.text.tag_configure(tag, foreground=str(color))
+				self._tag_colors[tag] = str(color)
+			except Exception:
+				pass
+
+	def _push_to_buffer(self, content: str) -> None:
+		self._line_buffer.extend(self._split_lines_with_category(content))
+
+	def _split_lines_with_category(self, content: str) -> list[tuple[str, str]]:
+		result: list[tuple[str, str]] = []
+		for line in content.splitlines(keepends=True):
+			category = self._pick_category(line)
+			result.append((line, category))
+		return result
+
+	def _redraw_from_buffer(self) -> None:
 		self.set_readonly(False)
-		self._insert_colored(content)
+		self.text.delete("1.0", "end")
+		for line, category in self._line_buffer:
+			if not self._category_visible.get(category, True):
+				continue
+			tag = self._category_to_tag.get(category, self._tag_default)
+			self.text.insert("end", line, (tag,))
 		self.text.see("end")
 		self.set_readonly(True)
 
-	def _insert_colored(self, content: str) -> None:
-		for line in content.splitlines(keepends=True):
-			tag = self._pick_tag(line)
-			self.text.insert("end", line, (tag,))
-
-	def _pick_tag(self, line: str) -> str:
+	def _pick_category(self, line: str) -> str:
 		line_lower = line.lower()
 		if any(keyword in line for keyword in ("对局结束", "游戏结束", "已死亡", "死亡", "胜者", "已暂停", "濒死", "死亡检定")):
-			return self._tag_important
+			return self._category_important
 		if "[deathcheck]" in line_lower:
-			return self._tag_important
+			return self._category_important
 		if "game_over" in line_lower:
-			return self._tag_important
+			return self._category_important
 		if "[公式]" in line:
-			return self._tag_system
+			return self._category_system
 		if "[ui]" in line_lower or "[event]" in line_lower:
-			return self._tag_system
+			return self._category_system
 		if "player" in line_lower:
-			return self._tag_player
+			return self._category_player
 		if "回合" in line:
-			return self._tag_round
-		return self._tag_default
+			return self._category_round
+		return self._category_default
 
 	def set_readonly(self, readonly: bool = True) -> None:
 		"""切换文本框是否可编辑。"""

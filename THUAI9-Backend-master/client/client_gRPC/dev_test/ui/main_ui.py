@@ -23,6 +23,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 
 from env import ActionSet, Area, AttackContext, Environment, PieceArg, Player, Point, SpellContext, SpellFactory
 from logic.controller import Controller
+from logic.test_mock_gameplay import ensure_test_mock_gameplay_installed
 from core.events import EventType
 
 from components import (
@@ -111,6 +112,79 @@ class MainUI:
 		self.attribute_settings_window: tk.Toplevel | None = None
 		self.attribute_settings_content_frame: ttk.LabelFrame | None = None
 		self.attribute_settings_nav_buttons: dict[str, ttk.Button] = {}
+		self.system_settings_window: tk.Toplevel | None = None
+		self.system_settings_content_frame: ttk.LabelFrame | None = None
+		self.system_settings_nav_buttons: dict[str, ttk.Button] = {}
+		# 系统设置：右侧信息展示区（InfoPanel）显示类别开关。
+		self.right_info_category_visibility_vars: dict[str, tk.BooleanVar] = {
+			"default": tk.BooleanVar(value=True),
+			"system": tk.BooleanVar(value=True),
+			"player": tk.BooleanVar(value=True),
+			"round": tk.BooleanVar(value=True),
+			"important": tk.BooleanVar(value=True),
+		}
+		# 颜色下拉框目前仅做 UI 预留（不影响渲染），先保留用户选择。
+		self.right_info_category_color_vars: dict[str, tk.StringVar] = {
+			"default": tk.StringVar(value="黑色"),
+			"system": tk.StringVar(value="灰色"),
+			"player": tk.StringVar(value="黑色"),
+			"round": tk.StringVar(value="橙色"),
+			"important": tk.StringVar(value="红色"),
+		}
+		# 玩法设计：属性派生上限梯度（默认值来自 dev_test 文档 talent_attributes.md，并与后端 env.py 一致）。
+		# - 力量：最大行动位上限 strength<=13/21 -> 1/2 else 3
+		# - 智力：最大法术位上限 intelligence<=3/7/12/16/21 -> 1/2/3/5/8 else 9
+		# - 敏捷：后端当前无“分段上限”梯度（移动力为公式），这里默认给 1 段占位（不影响后端）。
+		self._DEFAULT_DERIVED_CAP_THRESHOLDS: dict[str, list[int]] = {
+			"strength": [13, 21],
+			"dexterity": [],
+			"intelligence": [3, 7, 12, 16, 21],
+		}
+		self._DEFAULT_DERIVED_CAP_VALUES: dict[str, list[int]] = {
+			"strength": [1, 2, 3],
+			"dexterity": [0],
+			"intelligence": [1, 2, 3, 5, 8, 9],
+		}
+		self.design_talent_gradient_count_vars: dict[str, tk.IntVar] = {
+			"strength": tk.IntVar(value=len(self._DEFAULT_DERIVED_CAP_VALUES["strength"])),
+			"dexterity": tk.IntVar(value=len(self._DEFAULT_DERIVED_CAP_VALUES["dexterity"])),
+			"intelligence": tk.IntVar(value=len(self._DEFAULT_DERIVED_CAP_VALUES["intelligence"])),
+		}
+		self.design_talent_gradient_threshold_vars: dict[str, list[tk.StringVar]] = {
+			"strength": [],
+			"dexterity": [],
+			"intelligence": [],
+		}
+		self.design_talent_gradient_value_vars: dict[str, list[tk.StringVar]] = {
+			"strength": [],
+			"dexterity": [],
+			"intelligence": [],
+		}
+		self.design_talent_gradient_threshold_entries: dict[str, list[ttk.Entry]] = {
+			"strength": [],
+			"dexterity": [],
+			"intelligence": [],
+		}
+		self.design_talent_gradient_value_entries: dict[str, list[ttk.Entry]] = {
+			"strength": [],
+			"dexterity": [],
+			"intelligence": [],
+		}
+		self.design_talent_gradient_rows_frame: dict[str, ttk.Frame | None] = {
+			"strength": None,
+			"dexterity": None,
+			"intelligence": None,
+		}
+		self.design_attribute_status_var: tk.StringVar | None = None
+		# 仅用于“玩法设计-属性/全局”滚动：鼠标位于子控件上时仍能捕获滚轮。
+		self._design_attribute_mousewheel_bind_id: str | None = None
+		self._design_global_mousewheel_bind_id: str | None = None
+		# 玩法设计：全局 - 濒死系统（测试端独立玩法）
+		self.design_near_death_enabled_var = tk.BooleanVar(value=False)
+		self.design_near_death_revive_hp_var = tk.StringVar(value="1")
+		self.design_near_death_turns_to_die_var = tk.IntVar(value=1)
+		self.design_near_death_die_on_damage_var = tk.BooleanVar(value=True)
+		self.design_global_status_var: tk.StringVar | None = None
 		self.attribute_piece_vars: dict[str, dict[str, tk.StringVar]] = {}
 		self.attribute_piece_entries: dict[str, dict[str, tk.Entry]] = {}
 		self.attribute_piece_last_edit_tick: dict[str, int] = {}
@@ -2899,7 +2973,7 @@ class MainUI:
 			("回放模式", self._on_click_replay_mode),
 			("棋子行动", self._on_click_piece_action),
 			("属性设置", self._on_click_attribute_settings),
-			("系统设置", lambda: None),
+			("系统设置", self._on_click_system_settings),
 			("退出测试", self._on_click_exit),
 		]
 		self.right_button_panel = ButtonPanel(parent, title="操作区", buttons=buttons)
@@ -4800,6 +4874,984 @@ class MainUI:
 		if force_runtime_init:
 			self.root.wait_window(window)
 
+	def _on_click_system_settings(self) -> None:
+		"""打开系统设置窗口（框架）。
+
+		该窗口用于补充测试端功能与后端暂未实现的能力：
+		- 测试端显示/调试能力开关（综合设置）
+		- 全局玩法与行动规则的设计入口（玩法设计）
+		- 使用教程（长文本、可滚动，未来可改为读取独立文档）
+		- 开发信息与状态快照（开发信息）
+
+		注意：后续可能引入权限系统（基础/开发/最高权限），这里先搭 UI 框架。
+		"""
+		if getattr(self, "system_settings_window", None) is not None:
+			try:
+				if self.system_settings_window.winfo_exists():
+					self.system_settings_window.deiconify()
+					self.system_settings_window.lift()
+					self.system_settings_window.focus_force()
+					self._switch_system_settings_page("general")
+					return
+			except Exception:
+				pass
+
+		window = tk.Toplevel(self.root)
+		window.title("系统设置")
+		window.transient(self.root)
+		window.resizable(True, True)
+		window.geometry("900x520")
+		window.minsize(780, 420)
+		self.system_settings_window = window
+
+		main = ttk.Frame(window, padding=10)
+		main.pack(fill="both", expand=True)
+		main.columnconfigure(0, weight=0)
+		main.columnconfigure(1, weight=1)
+		main.rowconfigure(0, weight=1)
+
+		nav = ttk.LabelFrame(main, text="分类", padding=8)
+		nav.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+		nav.columnconfigure(0, weight=1)
+
+		content = ttk.LabelFrame(main, text="系统内容", padding=10)
+		content.grid(row=0, column=1, sticky="nsew")
+		content.columnconfigure(0, weight=1)
+		content.rowconfigure(0, weight=1)
+		self.system_settings_content_frame = content
+
+		self.system_settings_nav_buttons = {}
+		nav_items = [
+			("general", "综合设置"),
+			("design", "玩法设计"),
+			("tutorial", "使用教程"),
+			("dev", "开发信息"),
+		]
+		for row_idx, (page_key, title) in enumerate(nav_items):
+			btn = ttk.Button(nav, text=title, command=lambda key=page_key: self._switch_system_settings_page(key))
+			btn.grid(row=row_idx, column=0, sticky="ew", pady=(0, 8))
+			self.system_settings_nav_buttons[page_key] = btn
+
+		def on_close() -> None:
+			self.system_settings_window = None
+			self.system_settings_content_frame = None
+			self.system_settings_nav_buttons = {}
+			window.destroy()
+
+		window.protocol("WM_DELETE_WINDOW", on_close)
+		self._center_popup_window(window)
+		self._switch_system_settings_page("general")
+
+	def _switch_system_settings_page(self, page_key: str) -> None:
+		"""切换系统设置窗口的一级页面（框架）。"""
+		content = getattr(self, "system_settings_content_frame", None)
+		if content is None:
+			return
+		for widget in content.winfo_children():
+			widget.destroy()
+
+		builders = {
+			"general": self._build_system_settings_general_page,
+			"design": self._build_system_settings_design_page,
+			"tutorial": self._build_system_settings_tutorial_page,
+			"dev": self._build_system_settings_dev_page,
+		}
+		builder = builders.get(page_key)
+		if callable(builder):
+			builder(content)
+			self.right_info_panel.append_content(f"\n[UI] 系统设置页面切换: {page_key}")
+			return
+		self._build_system_settings_general_page(content)
+
+	def _build_system_settings_general_page(self, parent: ttk.LabelFrame) -> None:
+		wrapper = ttk.Frame(parent)
+		wrapper.grid(row=0, column=0, sticky="nsew")
+		wrapper.columnconfigure(0, weight=1)
+		wrapper.rowconfigure(3, weight=1)
+
+		intro = (
+			"这里用于配置测试端 UI/显示/调试能力等“仅测试端生效”的设置。\n"
+			"当前先落地：右侧信息展示区的“按类别显示/隐藏”。\n\n"
+			"提示：后续可能接入权限系统，不同权限可见/可改项不同。"
+		)
+		ttk.Label(wrapper, text="综合设置", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+		ttk.Label(wrapper, text=intro, justify="left", foreground="#4b5563").grid(row=1, column=0, sticky="nw")
+
+		boxes = ttk.Frame(wrapper)
+		boxes.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+		boxes.columnconfigure(0, weight=1)
+		boxes.columnconfigure(1, weight=1)
+
+		group = ttk.LabelFrame(boxes, text="右侧信息展示区：文字显示设置", padding=10)
+		group.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+		group.columnconfigure(0, weight=1)
+
+		reserve = ttk.LabelFrame(boxes, text="预留", padding=10)
+		reserve.grid(row=0, column=1, sticky="nsew")
+		reserve.columnconfigure(0, weight=1)
+		ttk.Label(reserve, text="（预留）后续综合设置项放这里", foreground="#6b7280").grid(row=0, column=0, sticky="nw")
+
+		header = ttk.Frame(group)
+		header.grid(row=0, column=0, sticky="ew")
+		header.columnconfigure(0, weight=1)
+		header.columnconfigure(1, weight=1)
+		header.columnconfigure(2, weight=1)
+		ttk.Label(header, text="类别", width=6).grid(row=0, column=0)
+		ttk.Label(header, text="是否显示", width=10).grid(row=0, column=1, padx=(10, 0))
+		ttk.Label(header, text="颜色（预留）", width=12).grid(row=0, column=2, padx=(10, 0))
+
+		color_options = ["黑色", "灰色", "红色", "橙色", "绿色", "蓝色"]
+		rows = [
+			("important", "重要"),
+			("round", "回合"),
+			("player", "玩家"),
+			("system", "系统"),
+			("default", "默认"),
+		]
+		for idx, (key, label) in enumerate(rows, start=1):
+			row = ttk.Frame(group)
+			row.grid(row=idx, column=0, sticky="ew", pady=(6, 0))
+			row.columnconfigure(0, weight=1)
+			row.columnconfigure(1, weight=1)
+			row.columnconfigure(2, weight=1)
+			ttk.Label(row, text=label, width=6).grid(row=0, column=0)
+			ttk.Checkbutton(row, variable=self.right_info_category_visibility_vars[key]).grid(
+				row=0, column=1, padx=(5, 0)
+			)
+			combo = ttk.Combobox(
+				row,
+				values=color_options,
+				textvariable=self.right_info_category_color_vars[key],
+				state="readonly",
+				width=12,
+			)
+			combo.grid(row=0, column=2, padx=(20, 0))
+
+		btn_row = ttk.Frame(wrapper)
+		btn_row.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+		btn_row.columnconfigure(0, weight=1)
+		status_var = tk.StringVar(value="")
+		status_label = ttk.Label(btn_row, textvariable=status_var, foreground="#6b7280")
+		status_label.grid(row=0, column=0, sticky="w")
+
+		apply_btn = ttk.Button(btn_row, text="应用", command=lambda: self._apply_system_general_settings(apply_btn, status_var))
+		apply_btn.grid(row=0, column=1, sticky="e")
+
+	def _apply_system_general_settings(self, apply_btn: ttk.Button, status_var: tk.StringVar) -> None:
+		"""应用综合设置：目前仅落地右侧信息展示区类别开关。"""
+		try:
+			apply_btn.configure(state="disabled")
+			visibility = {key: var.get() for key, var in self.right_info_category_visibility_vars.items()}
+			color_map = {
+				"黑色": "#111111",
+				"灰色": "#6b7280",
+				"红色": "#dc2626",
+				"橙色": "#f97316",
+				"绿色": "#22c55e",
+				"蓝色": "#2563eb",
+			}
+			colors = {
+				key: color_map.get(str(var.get()).strip() or "黑色", "#111111")
+				for key, var in self.right_info_category_color_vars.items()
+			}
+			if getattr(self, "right_info_panel", None) is not None:
+				self.right_info_panel.set_category_visibility(visibility)
+				self.right_info_panel.set_category_colors(colors)
+			status_var.set("已应用：右侧信息展示区类别显示/颜色")
+			self.root.after(1500, lambda: status_var.set(""))
+			try:
+				self.right_info_panel.append_content("\n[UI] 已应用综合设置：右侧信息展示区类别显示/颜色")
+			except Exception:
+				pass
+		finally:
+			apply_btn.configure(state="normal")
+
+	def _build_system_settings_design_page(self, parent: ttk.LabelFrame) -> None:
+		wrapper = ttk.Frame(parent)
+		wrapper.grid(row=0, column=0, sticky="nsew")
+		wrapper.columnconfigure(0, weight=1)
+		wrapper.rowconfigure(2, weight=1)
+
+		intro = (
+			"这里将用于设计全局玩法规则/行动规则，并支持扩展新的行动、职业、法术等。\n"
+			"当前先搭建页内多区域切换框架（类似行动设置中的攻击/法术切换）。\n\n"
+			"实现策略倾向：不改后端文件，通过测试端运行时注入（monkeypatch）让本局生效。"
+		)
+		ttk.Label(wrapper, text="玩法设计", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+		ttk.Label(wrapper, text=intro, justify="left", foreground="#4b5563").grid(row=1, column=0, sticky="nw")
+
+		nb = ttk.Notebook(wrapper)
+		nb.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+
+		# 全局
+		tab_global = ttk.Frame(nb, padding=10)
+		tab_global.columnconfigure(0, weight=1)
+		tab_global.rowconfigure(0, weight=1)
+		self._build_design_global_page(tab_global)
+		nb.add(tab_global, text="全局")
+
+		# 属性（天赋梯度）
+		tab_attr = ttk.Frame(nb, padding=10)
+		tab_attr.columnconfigure(0, weight=1)
+		tab_attr.rowconfigure(0, weight=1)
+		self._build_design_attribute_page(tab_attr)
+		nb.add(tab_attr, text="属性")
+
+		# 其余占位
+		for title in ("法术", "攻击", "职业"):
+			tab = ttk.Frame(nb, padding=10)
+			tab.columnconfigure(0, weight=1)
+			tab.rowconfigure(0, weight=1)
+			ttk.Label(tab, text=f"（占位）{title}相关全局设置区域", justify="left", foreground="#6b7280").grid(
+				row=0, column=0, sticky="nw"
+			)
+			nb.add(tab, text=title)
+
+	def _build_design_attribute_page(self, parent: ttk.Frame) -> None:
+		"""玩法设计 -> 属性页面：属性派生上限梯度（最大行动位/最大法术位）。"""
+		# 该页内容可能较高（梯度数=7 时），因此只对“属性页”做有限高度滚动。
+		parent.columnconfigure(0, weight=1)
+		parent.rowconfigure(0, weight=1)
+		parent.rowconfigure(1, weight=0)
+
+		scroll_host = ttk.Frame(parent)
+		scroll_host.grid(row=0, column=0, sticky="nsew")
+		scroll_host.columnconfigure(0, weight=1)
+		scroll_host.rowconfigure(0, weight=1)
+
+		canvas = tk.Canvas(scroll_host, highlightthickness=0, borderwidth=0)
+		v_scroll = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview)
+		canvas.configure(yscrollcommand=v_scroll.set)
+		canvas.grid(row=0, column=0, sticky="nsew")
+		v_scroll.grid(row=0, column=1, sticky="ns")
+		# 限制可视高度：约为原本“无滚动”体验的 1.5 倍（取一个稳定的固定值）。
+		canvas.configure(height=520)
+
+		body = ttk.Frame(canvas)
+		canvas_window = canvas.create_window((0, 0), window=body, anchor="nw")
+		body.columnconfigure(0, weight=1)
+
+		def _sync_scroll_region(_event: Any = None) -> None:
+			try:
+				body.update_idletasks()
+				req_w = int(body.winfo_reqwidth())
+				req_h = int(body.winfo_reqheight())
+				canvas.configure(scrollregion=(0, 0, max(req_w, 1), max(req_h, 1)))
+			except Exception:
+				canvas.configure(scrollregion=canvas.bbox("all"))
+
+		def _fit_body_width(event: Any) -> None:
+			try:
+				canvas.itemconfigure(canvas_window, width=int(event.width))
+			except Exception:
+				pass
+
+		def _on_mousewheel(event: Any) -> None:
+			# 内容不足一屏时，不滚动；同时夹紧到顶/底，避免“无限滑动到空白”。
+			try:
+				sr = str(canvas.cget("scrollregion") or "").strip()
+				parts = [float(x) for x in sr.split()] if sr else []
+				content_h = float(parts[3] - parts[1]) if len(parts) == 4 else 0.0
+				view_h = float(canvas.winfo_height())
+				if content_h <= view_h + 2:
+					return
+			except Exception:
+				pass
+			try:
+				delta = int(getattr(event, "delta", 0))
+				if delta == 0:
+					return
+			except Exception:
+				return
+			try:
+				canvas.yview_scroll(-int(delta / 120), "units")
+				first, last = canvas.yview()
+				if first < 0:
+					canvas.yview_moveto(0)
+				elif last > 1:
+					span = max(1e-9, last - first)
+					canvas.yview_moveto(max(0.0, 1.0 - span))
+			except Exception:
+				return
+
+		def _bind_wheel_global() -> None:
+			if self._design_attribute_mousewheel_bind_id is None:
+				try:
+					self._design_attribute_mousewheel_bind_id = self.root.bind_all(
+						"<MouseWheel>", _on_mousewheel, add="+"
+					)
+				except Exception:
+					self._design_attribute_mousewheel_bind_id = None
+
+		def _unbind_wheel_global() -> None:
+			if self._design_attribute_mousewheel_bind_id is not None:
+				try:
+					self.root.unbind_all("<MouseWheel>", self._design_attribute_mousewheel_bind_id)
+				except Exception:
+					pass
+				self._design_attribute_mousewheel_bind_id = None
+
+		body.bind("<Configure>", _sync_scroll_region)
+		canvas.bind("<Configure>", _fit_body_width)
+		scroll_host.bind("<Enter>", lambda _e: _bind_wheel_global())
+		scroll_host.bind("<Leave>", lambda _e: _unbind_wheel_global())
+
+		ttk.Label(body, text="属性派生上限梯度", font=("Microsoft YaHei UI", 11, "bold")).grid(
+			row=0, column=0, sticky="w", pady=(0, 8)
+		)
+
+		note = (
+			"说明：这里编辑的是后端已实现的‘派生上限梯度’，默认值来自 dev_test 文档 talent_attributes.md。\n"
+			"- 力量：最大行动位上限（<=13/21 → 1/2 else 3）\n"
+			"- 智力：最大法术位上限（<=3/7/12/16/21 → 1/2/3/5/8 else 9）\n"
+			"应用后仅本局生效：通过运行时 hook 覆写计算方式，不改后端文件。"
+		)
+		ttk.Label(body, text=note, justify="left", foreground="#4b5563").grid(row=1, column=0, sticky="nw", pady=(0, 8))
+
+		block = ttk.LabelFrame(body, text="调整派生上限梯度", padding=10)
+		block.grid(row=2, column=0, sticky="nsew")
+		block.columnconfigure(0, weight=1)
+		block.rowconfigure(0, weight=1)
+
+		cols = ttk.Frame(block)
+		cols.grid(row=0, column=0, sticky="nsew")
+		for c in range(3):
+			cols.columnconfigure(c, weight=1)
+
+		def _build_one(stat_key: str, title: str, col_idx: int) -> None:
+			frame = ttk.LabelFrame(cols, text=title, padding=8)
+			frame.grid(row=0, column=col_idx, sticky="nsew", padx=(0, 10) if col_idx < 2 else 0)
+			frame.columnconfigure(0, weight=1)
+
+			row0 = ttk.Frame(frame)
+			row0.grid(row=0, column=0, sticky="ew")
+			row0.columnconfigure(0, weight=1)
+			ttk.Label(row0, text="设置共", width=5).grid(row=0, column=0, sticky="w")
+			spin = tk.Spinbox(
+				row0,
+				from_=1,
+				to=7,
+				width=3,
+				textvariable=self.design_talent_gradient_count_vars[stat_key],
+			)
+			spin.grid(row=0, column=1, sticky="w", padx=(6, 6))
+			ttk.Label(row0, text="个梯度").grid(row=0, column=2, sticky="w")
+			ttk.Button(
+				row0,
+				text="确定",
+				width=4,
+				command=lambda: self._rebuild_talent_gradient_rows(stat_key),
+			).grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+			rows = ttk.Frame(frame)
+			rows.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+			rows.columnconfigure(0, weight=1)
+			self.design_talent_gradient_rows_frame[stat_key] = rows
+
+			# 首次进入：注入默认值，并生成行（若已有残留但为空/不完整，也视为未初始化）。
+			self._ensure_one_talent_gradient_initialized(stat_key)
+
+		_build_one("strength", "力量", 0)
+		_build_one("dexterity", "敏捷", 1)
+		_build_one("intelligence", "智力", 2)
+
+		# 固定按钮行：不随滚动移动
+		btn_row = ttk.Frame(parent)
+		btn_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+		btn_row.columnconfigure(0, weight=1)
+		if self.design_attribute_status_var is None:
+			self.design_attribute_status_var = tk.StringVar(value="")
+		ttk.Label(btn_row, textvariable=self.design_attribute_status_var, foreground="#6b7280").grid(row=0, column=0, sticky="w")
+		apply_btn = ttk.Button(btn_row, text="应用", command=lambda: self._apply_design_attribute_talent_gradients(apply_btn))
+		apply_btn.grid(row=0, column=1, sticky="e")
+		reset_btn = ttk.Button(btn_row, text="恢复默认", command=lambda: self._reset_design_attribute_talent_gradients(reset_btn))
+		reset_btn.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+	def _ensure_one_talent_gradient_initialized(self, stat_key: str) -> None:
+		"""确保某个天赋梯度已初始化为合法默认值（首次进入/被格式化清空时兜底）。"""
+		try:
+			n = int(self.design_talent_gradient_count_vars[stat_key].get())
+		except Exception:
+			n = 0
+		old_th = self.design_talent_gradient_threshold_vars.get(stat_key) or []
+		old_val = self.design_talent_gradient_value_vars.get(stat_key) or []
+		complete = (
+			1 <= n <= 7
+			and len(old_val) == n
+			and len(old_th) == max(0, n - 1)
+			and all(str(v.get()).strip() != "" for v in old_val)
+			and (n == 1 or all(str(v.get()).strip() != "" for v in old_th))
+		)
+		if not complete:
+			self._reset_one_talent_gradient_to_default(stat_key)
+			return
+		self._rebuild_talent_gradient_rows(stat_key, preserve_values=True)
+
+	def _clear_design_attribute_gradient_error_highlight(self) -> None:
+		for stat_key in ("strength", "dexterity", "intelligence"):
+			for entry in self.design_talent_gradient_threshold_entries.get(stat_key, []):
+				try:
+					entry.configure(foreground="#111111")
+				except Exception:
+					pass
+			for entry in self.design_talent_gradient_value_entries.get(stat_key, []):
+				try:
+					entry.configure(foreground="#111111")
+				except Exception:
+					pass
+
+	def _reset_one_talent_gradient_to_default(self, stat_key: str) -> None:
+		default_thresholds = self._DEFAULT_DERIVED_CAP_THRESHOLDS.get(stat_key, [])
+		default_values = self._DEFAULT_DERIVED_CAP_VALUES.get(stat_key, [0])
+		self.design_talent_gradient_count_vars[stat_key].set(len(default_values))
+		self.design_talent_gradient_threshold_vars[stat_key] = [tk.StringVar(value=str(x)) for x in default_thresholds]
+		self.design_talent_gradient_value_vars[stat_key] = [tk.StringVar(value=str(x)) for x in default_values]
+		self._rebuild_talent_gradient_rows(stat_key, preserve_values=True)
+
+	def _reset_design_attribute_talent_gradients(self, btn: ttk.Button) -> None:
+		try:
+			btn.configure(state="disabled")
+			self._clear_design_attribute_gradient_error_highlight()
+			for stat_key in ("strength", "dexterity", "intelligence"):
+				self._reset_one_talent_gradient_to_default(stat_key)
+			if self.design_attribute_status_var is not None:
+				self.design_attribute_status_var.set("已恢复默认（与 talent_attributes.md 一致）")
+				self.root.after(1500, lambda: self.design_attribute_status_var.set(""))
+			try:
+				self.right_info_panel.append_content("\n[UI] 玩法设计-属性：已恢复派生上限梯度默认值")
+			except Exception:
+				pass
+		finally:
+			btn.configure(state="normal")
+
+	def _rebuild_talent_gradient_rows(self, stat_key: str, preserve_values: bool = True) -> None:
+		rows = self.design_talent_gradient_rows_frame.get(stat_key)
+		if rows is None:
+			return
+		for w in rows.winfo_children():
+			w.destroy()
+
+		try:
+			n = int(self.design_talent_gradient_count_vars[stat_key].get())
+		except Exception:
+			n = 4
+		n = max(1, min(7, n))
+		self.design_talent_gradient_count_vars[stat_key].set(n)
+
+		old_th_vars = self.design_talent_gradient_threshold_vars.get(stat_key, [])
+		old_val_vars = self.design_talent_gradient_value_vars.get(stat_key, [])
+		new_th_vars: list[tk.StringVar] = []
+		new_val_vars: list[tk.StringVar] = []
+
+		for i in range(max(0, n - 1)):
+			v = tk.StringVar(value="")
+			if preserve_values and i < len(old_th_vars):
+				try:
+					v.set(str(old_th_vars[i].get()))
+				except Exception:
+					pass
+			new_th_vars.append(v)
+		for i in range(n):
+			v = tk.StringVar(value="")
+			if preserve_values and i < len(old_val_vars):
+				try:
+					v.set(str(old_val_vars[i].get()))
+				except Exception:
+					pass
+			new_val_vars.append(v)
+
+		self.design_talent_gradient_threshold_vars[stat_key] = new_th_vars
+		self.design_talent_gradient_value_vars[stat_key] = new_val_vars
+		self.design_talent_gradient_threshold_entries[stat_key] = []
+		self.design_talent_gradient_value_entries[stat_key] = []
+
+		for i in range(n):
+			row = ttk.Frame(rows)
+			row.grid(row=i, column=0, sticky="ew", pady=(0, 6))
+			row.columnconfigure(3, weight=1)
+			if i < n - 1:
+				ttk.Label(row, text="<=", width=3).grid(row=0, column=0, sticky="w")
+				th_entry = ttk.Entry(row, textvariable=new_th_vars[i], width=6)
+				th_entry.grid(row=0, column=1, sticky="w")
+				self.design_talent_gradient_threshold_entries[stat_key].append(th_entry)
+			else:
+				ttk.Label(row, text="else", width=4).grid(row=0, column=0, sticky="w")
+				ttk.Label(row, text="", width=1).grid(row=0, column=1, sticky="w")
+			ttk.Label(row, text=">>>", width=4).grid(row=0, column=2, sticky="w", padx=(8, 8))
+			val_entry = ttk.Entry(row, textvariable=new_val_vars[i], width=6)
+			val_entry.grid(row=0, column=3, sticky="w")
+			self.design_talent_gradient_value_entries[stat_key].append(val_entry)
+
+	def _build_design_global_page(self, parent: ttk.Frame) -> None:
+		"""玩法设计 -> 全局页面：目前仅实现濒死系统（测试端独立玩法）。"""
+		parent.columnconfigure(0, weight=1)
+		parent.rowconfigure(1, weight=1)
+		parent.rowconfigure(2, weight=0)
+
+		ttk.Label(parent, text="全局玩法", font=("Microsoft YaHei UI", 11, "bold")).grid(
+			row=0, column=0, sticky="w", pady=(0, 8)
+		)
+
+		# 内容可能较高：用自适应高度滚动容器，避免控件“跑到界面外”。
+		scroll_host = ttk.Frame(parent)
+		scroll_host.grid(row=1, column=0, sticky="nsew")
+		scroll_host.columnconfigure(0, weight=1)
+		scroll_host.rowconfigure(0, weight=1)
+
+		canvas = tk.Canvas(scroll_host, highlightthickness=0, borderwidth=0)
+		v_scroll = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview)
+		canvas.configure(yscrollcommand=v_scroll.set)
+		canvas.grid(row=0, column=0, sticky="nsew")
+		v_scroll.grid(row=0, column=1, sticky="ns")
+
+		body = ttk.Frame(canvas)
+		canvas_window = canvas.create_window((0, 0), window=body, anchor="nw")
+		body.columnconfigure(0, weight=1)
+
+		def _sync_scroll_region(_event: Any = None) -> None:
+			try:
+				body.update_idletasks()
+				req_w = int(body.winfo_reqwidth())
+				req_h = int(body.winfo_reqheight())
+				canvas.configure(scrollregion=(0, 0, max(req_w, 1), max(req_h, 1)))
+				# 自适应高度：内容少时贴合；内容多时给上限并允许滚动。
+				desired = min(max(req_h + 8, 180), 520)
+				canvas.configure(height=int(desired))
+			except Exception:
+				canvas.configure(scrollregion=canvas.bbox("all"))
+
+		note_label: ttk.Label | None = None
+		preview: ttk.Label | None = None
+
+		def _fit_body_width(event: Any) -> None:
+			try:
+				w = int(event.width)
+			except Exception:
+				w = 0
+			try:
+				canvas.itemconfigure(canvas_window, width=max(w, 1))
+			except Exception:
+				pass
+			wrap = max(200, w - 40)
+			try:
+				if note_label is not None:
+					note_label.configure(wraplength=wrap)
+			except Exception:
+				pass
+			try:
+				if preview is not None:
+					preview.configure(wraplength=wrap)
+			except Exception:
+				pass
+
+		def _on_mousewheel(event: Any) -> None:
+			try:
+				sr = str(canvas.cget("scrollregion") or "").strip()
+				parts = [float(x) for x in sr.split()] if sr else []
+				content_h = float(parts[3] - parts[1]) if len(parts) == 4 else 0.0
+				view_h = float(canvas.winfo_height())
+				if content_h <= view_h + 2:
+					return
+			except Exception:
+				pass
+			try:
+				delta = int(getattr(event, "delta", 0))
+				if delta == 0:
+					return
+			except Exception:
+				return
+			try:
+				canvas.yview_scroll(-int(delta / 120), "units")
+				first, last = canvas.yview()
+				if first < 0:
+					canvas.yview_moveto(0)
+				elif last > 1:
+					span = max(1e-9, last - first)
+					canvas.yview_moveto(max(0.0, 1.0 - span))
+			except Exception:
+				return
+
+		def _bind_wheel_global() -> None:
+			if self._design_global_mousewheel_bind_id is None:
+				try:
+					self._design_global_mousewheel_bind_id = self.root.bind_all(
+						"<MouseWheel>", _on_mousewheel, add="+"
+					)
+				except Exception:
+					self._design_global_mousewheel_bind_id = None
+
+		def _unbind_wheel_global() -> None:
+			if self._design_global_mousewheel_bind_id is not None:
+				try:
+					self.root.unbind_all("<MouseWheel>", self._design_global_mousewheel_bind_id)
+				except Exception:
+					pass
+				self._design_global_mousewheel_bind_id = None
+
+		body.bind("<Configure>", _sync_scroll_region)
+		canvas.bind("<Configure>", _fit_body_width)
+		scroll_host.bind("<Enter>", lambda _e: _bind_wheel_global())
+		scroll_host.bind("<Leave>", lambda _e: _unbind_wheel_global())
+
+		box = ttk.LabelFrame(body, text="濒死系统（测试端独立玩法）", padding=10)
+		box.grid(row=0, column=0, sticky="nsew")
+		box.columnconfigure(0, weight=1)
+
+		note = (
+			"设计来源：warchess_plan (1).md（后端当前未实现，故仅在测试端启用）。\n"
+			"当棋子生命降为 0 时触发死亡检定；结果可能进入【濒死】。濒死期间轮到其行动会被跳过。"
+		)
+		note_label = ttk.Label(box, text=note, justify="left", foreground="#4b5563")
+		note_label.grid(row=0, column=0, sticky="w")
+
+		enable_row = ttk.Frame(box)
+		enable_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+		# 避免把 Entry 所在列拉伸导致“【空】HP”间隔过大：把弹性空间放到最后一列。
+		enable_row.columnconfigure(4, weight=1)
+		ttk.Checkbutton(enable_row, text="启用濒死系统（默认关闭）", variable=self.design_near_death_enabled_var).grid(
+			row=0, column=0, sticky="w"
+		)
+		ttk.Label(enable_row, text="死亡检定 d20=20 恢复至").grid(row=0, column=1, sticky="w", padx=(14, 0))
+		revive_entry = ttk.Entry(enable_row, textvariable=self.design_near_death_revive_hp_var, width=6)
+		revive_entry.grid(row=0, column=2, sticky="w", padx=(6, 6))
+		ttk.Label(enable_row, text="HP").grid(row=0, column=3, sticky="w")
+		ttk.Label(enable_row, text="").grid(row=0, column=4, sticky="ew")
+
+		param_row = ttk.Frame(box)
+		param_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+		ttk.Label(param_row, text="濒死后，在被跳过").grid(row=0, column=0, sticky="w")
+		turn_spin = tk.Spinbox(param_row, from_=1, to=3, width=3, textvariable=self.design_near_death_turns_to_die_var)
+		turn_spin.grid(row=0, column=1, sticky="w", padx=(6, 6))
+		ttk.Label(param_row, text="次行动后直接死亡").grid(row=0, column=2, sticky="w")
+		ttk.Checkbutton(param_row, text="濒死期间再次受伤直接死亡", variable=self.design_near_death_die_on_damage_var).grid(
+			row=0, column=3, sticky="w", padx=(14, 0)
+		)
+
+		preview_var = tk.StringVar(value="")
+		preview = ttk.Label(box, textvariable=preview_var, justify="left", foreground="#374151")
+		preview.grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+		def _refresh_preview(*_args: Any) -> None:
+			enabled = bool(self.design_near_death_enabled_var.get())
+			revive_hp = str(self.design_near_death_revive_hp_var.get()).strip() or "1"
+			try:
+				turns = int(self.design_near_death_turns_to_die_var.get())
+			except Exception:
+				turns = 1
+			turns = max(1, min(3, turns))
+			die_on_damage = bool(self.design_near_death_die_on_damage_var.get())
+			preview_var.set(
+				"\n".join(
+					[
+						f"当前：{'开启' if enabled else '关闭'}",
+						"死亡检定：HP→0 时掷 d20；20 恢复；1 直接死亡；其他进入濒死",
+						f"d20=20：恢复至 {revive_hp} HP",
+						f"濒死：轮到该棋子时跳过行动；累计跳过 {turns} 次后死亡",
+						f"濒死期间再次受伤：{'直接死亡' if die_on_damage else '按死亡检定处理'}",
+						"被治疗至 >0：解除濒死",
+					]
+				)
+			)
+
+		for var in (
+			self.design_near_death_enabled_var,
+			self.design_near_death_revive_hp_var,
+			self.design_near_death_turns_to_die_var,
+			self.design_near_death_die_on_damage_var,
+		):
+			try:
+				var.trace_add("write", _refresh_preview)
+			except Exception:
+				pass
+		_refresh_preview()
+
+		# 固定按钮行：不随滚动移动
+		btn_row = ttk.Frame(parent)
+		btn_row.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+		btn_row.columnconfigure(0, weight=1)
+		if self.design_global_status_var is None:
+			self.design_global_status_var = tk.StringVar(value="")
+		ttk.Label(btn_row, textvariable=self.design_global_status_var, foreground="#6b7280").grid(
+			row=0, column=0, sticky="w"
+		)
+		apply_btn = ttk.Button(btn_row, text="应用", command=lambda: self._apply_design_global_near_death_settings(apply_btn))
+		apply_btn.grid(row=0, column=1, sticky="e")
+
+	def _apply_design_global_near_death_settings(self, btn: ttk.Button) -> None:
+		"""应用玩法设计->全局：濒死系统配置（仅本局运行时 env 生效）。"""
+		try:
+			btn.configure(state="disabled")
+			enabled = bool(self.design_near_death_enabled_var.get())
+			revive_hp = self._parse_int_or_none(self.design_near_death_revive_hp_var.get())
+			if revive_hp is None or revive_hp < 1:
+				if self.design_global_status_var is not None:
+					self.design_global_status_var.set("非法：恢复 HP 必须为 >=1 的整数")
+					self.root.after(1800, lambda: self.design_global_status_var.set(""))
+				return
+			try:
+				turns_to_die = int(self.design_near_death_turns_to_die_var.get())
+			except Exception:
+				turns_to_die = 1
+			turns_to_die = max(1, min(3, turns_to_die))
+			die_on_damage = bool(self.design_near_death_die_on_damage_var.get())
+
+			config = {
+				"near_death": {
+					"enabled": enabled,
+					"revive_hp_on_20": int(revive_hp),
+					"turns_to_die": int(turns_to_die),
+					"die_on_damage_when_dying": bool(die_on_damage),
+				}
+			}
+			ok = self._apply_near_death_config_to_runtime_environment(config)
+			if not ok:
+				if self.design_global_status_var is not None:
+					self.design_global_status_var.set("未生效：当前未加载 runtime env")
+					self.root.after(1800, lambda: self.design_global_status_var.set(""))
+				return
+			if self.design_global_status_var is not None:
+				self.design_global_status_var.set("应用成功：濒死系统已注入（本局生效）")
+				self.root.after(1800, lambda: self.design_global_status_var.set(""))
+			try:
+				self.right_info_panel.append_content("\n[UI] 玩法设计-全局：濒死系统配置已应用（本局临时生效）")
+			except Exception:
+				pass
+		finally:
+			btn.configure(state="normal")
+
+	def _apply_near_death_config_to_runtime_environment(self, config: dict[str, Any]) -> bool:
+		if self.controller.runtime_source != "runtime_env":
+			return False
+		env = getattr(self.controller, "environment", None)
+		if env is None:
+			return False
+		setattr(env, "_ui_near_death_config", config.get("near_death", {}) if isinstance(config, dict) else {})
+		# 安装测试端玩法 hook（仅一次），并在 hook 内动态读取 _ui_near_death_config。
+		try:
+			ensure_test_mock_gameplay_installed(env, logger=lambda msg: self.right_info_panel.append_content(f"\n{msg}"))
+		except Exception:
+			try:
+				ensure_test_mock_gameplay_installed(env)
+			except Exception:
+				pass
+		# 若已安装行动设置 hook，需要确保其对“濒死目标可被攻击”兼容（hook 内动态读取配置）。
+		try:
+			snapshot = (
+				self.action_settings_snapshot
+				if isinstance(self.action_settings_snapshot, dict) and self.action_settings_snapshot
+				else self._default_action_settings_snapshot()
+			)
+			self._apply_action_settings_to_runtime_environment(snapshot)
+		except Exception:
+			pass
+		return True
+
+	def _parse_int_or_none(self, raw: Any) -> int | None:
+		try:
+			s = str(raw).strip()
+			if s == "":
+				return None
+			return int(s)
+		except Exception:
+			return None
+
+	def _apply_design_attribute_talent_gradients(self, btn: ttk.Button) -> None:
+		try:
+			btn.configure(state="disabled")
+			self._clear_design_attribute_gradient_error_highlight()
+			config: dict[str, dict[str, list[int]]] = {}
+
+			for stat_key in ("strength", "dexterity", "intelligence"):
+				try:
+					n = int(self.design_talent_gradient_count_vars[stat_key].get())
+				except Exception:
+					n = 0
+				if n < 1 or n > 7:
+					if self.design_attribute_status_var is not None:
+						self.design_attribute_status_var.set("非法：梯度数范围应为 1-7")
+					return
+
+				thresholds: list[int] = []
+				values: list[int] = []
+				for i in range(max(0, n - 1)):
+					v = self._parse_int_or_none(self.design_talent_gradient_threshold_vars[stat_key][i].get())
+					if v is None:
+						try:
+							self.design_talent_gradient_threshold_entries[stat_key][i].configure(foreground="#dc2626")
+						except Exception:
+							pass
+						if self.design_attribute_status_var is not None:
+							self.design_attribute_status_var.set("非法：梯度阈值必须为整数")
+						return
+					thresholds.append(int(v))
+				for i in range(n):
+					v = self._parse_int_or_none(self.design_talent_gradient_value_vars[stat_key][i].get())
+					if v is None:
+						try:
+							self.design_talent_gradient_value_entries[stat_key][i].configure(foreground="#dc2626")
+						except Exception:
+							pass
+						if self.design_attribute_status_var is not None:
+							self.design_attribute_status_var.set("非法：对应取值必须为整数")
+						return
+					values.append(int(v))
+
+				if n > 1:
+					if thresholds[0] < 1:
+						try:
+							self.design_talent_gradient_threshold_entries[stat_key][0].configure(foreground="#dc2626")
+						except Exception:
+							pass
+						if self.design_attribute_status_var is not None:
+							self.design_attribute_status_var.set("非法：最上方梯度阈值应 >= 1")
+						return
+					for i in range(1, len(thresholds)):
+						if thresholds[i] <= thresholds[i - 1]:
+							try:
+								self.design_talent_gradient_threshold_entries[stat_key][i].configure(foreground="#dc2626")
+							except Exception:
+								pass
+							if self.design_attribute_status_var is not None:
+								self.design_attribute_status_var.set("非法：梯度阈值需自上而下严格递增")
+							return
+				if values[0] < 0:
+					try:
+						self.design_talent_gradient_value_entries[stat_key][0].configure(foreground="#dc2626")
+					except Exception:
+						pass
+					if self.design_attribute_status_var is not None:
+						self.design_attribute_status_var.set("非法：第一行对应取值应 >= 0")
+					return
+				for i in range(1, len(values)):
+					if values[i] <= values[i - 1]:
+						try:
+							self.design_talent_gradient_value_entries[stat_key][i].configure(foreground="#dc2626")
+						except Exception:
+							pass
+						if self.design_attribute_status_var is not None:
+							self.design_attribute_status_var.set("非法：对应取值需自上而下严格递增")
+						return
+
+				config[stat_key] = {"thresholds": thresholds, "values": values}
+
+			ok = self._apply_talent_gradient_config_to_runtime_environment(config)
+			if not ok:
+				if self.design_attribute_status_var is not None:
+					self.design_attribute_status_var.set("未生效：当前未加载 runtime env")
+				return
+			if self.design_attribute_status_var is not None:
+				self.design_attribute_status_var.set("应用成功：派生上限梯度已注入（本局生效）")
+				self.root.after(1800, lambda: self.design_attribute_status_var.set(""))
+			try:
+				self.right_info_panel.append_content("\n[UI] 玩法设计-属性：派生上限梯度已应用（本局临时生效）")
+			except Exception:
+				pass
+		finally:
+			btn.configure(state="normal")
+
+	def _apply_talent_gradient_config_to_runtime_environment(self, config: dict[str, Any]) -> bool:
+		if self.controller.runtime_source != "runtime_env":
+			return False
+		env = getattr(self.controller, "environment", None)
+		if env is None:
+			return False
+		# 语义：派生上限梯度（最大行动位/最大法术位）
+		setattr(env, "_ui_talent_derived_config", config if isinstance(config, dict) else {})
+		# 安装测试端玩法 hook（幂等），由 hook 动态读取 _ui_talent_derived_config。
+		try:
+			ensure_test_mock_gameplay_installed(env, logger=lambda msg: self.right_info_panel.append_content(f"\n{msg}"))
+		except Exception:
+			try:
+				ensure_test_mock_gameplay_installed(env)
+			except Exception:
+				pass
+		# 立即重算当前场上的上限，保证本局立刻可见。
+		try:
+			for player_attr in ("player1", "player2"):
+				player = getattr(env, player_attr, None)
+				pieces = getattr(player, "pieces", None) if player is not None else None
+				if not pieces:
+					continue
+				for piece in list(pieces):
+					acc = piece.get_accessor() if hasattr(piece, "get_accessor") else None
+					if acc is None:
+						continue
+					try:
+						if callable(getattr(acc, "set_max_action_points", None)):
+							acc.set_max_action_points()
+						if callable(getattr(acc, "set_max_spell_slots", None)):
+							acc.set_max_spell_slots()
+						try:
+							piece.action_points = min(
+								int(getattr(piece, "action_points", 0)), int(getattr(piece, "max_action_points", 0))
+							)
+						except Exception:
+							pass
+						try:
+							piece.spell_slots = min(
+								int(getattr(piece, "spell_slots", 0)), int(getattr(piece, "max_spell_slots", 0))
+							)
+						except Exception:
+							pass
+					except Exception:
+						continue
+		except Exception:
+			pass
+		return True
+
+	def _build_system_settings_tutorial_page(self, parent: ttk.LabelFrame) -> None:
+		wrapper = ttk.Frame(parent)
+		wrapper.grid(row=0, column=0, sticky="nsew")
+		wrapper.columnconfigure(0, weight=1)
+		wrapper.rowconfigure(1, weight=1)
+
+		ttk.Label(wrapper, text="使用教程", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+		path = os.path.join(os.path.dirname(__file__), "assets", "tutorial.txt")
+		path_var = tk.StringVar(value=f"文件：{path}")
+		top = ttk.Frame(wrapper)
+		top.grid(row=0, column=1, sticky="e")
+		ttk.Button(top, text="刷新", command=lambda: _reload()).grid(row=0, column=0, sticky="e")
+
+		text = tk.Text(wrapper, wrap="word", font=("Microsoft YaHei UI", 10), relief="flat")
+		sb = ttk.Scrollbar(wrapper, orient="vertical", command=text.yview)
+		text.configure(yscrollcommand=sb.set)
+		text.grid(row=1, column=0, sticky="nsew")
+		sb.grid(row=1, column=1, sticky="ns")
+		footer = ttk.Label(wrapper, textvariable=path_var, foreground="#6b7280")
+		footer.grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+		def _reload() -> None:
+			text.configure(state="normal")
+			text.delete("1.0", "end")
+			try:
+				with open(path, "r", encoding="utf-8") as f:
+					content = f.read()
+			except FileNotFoundError:
+				content = (
+					"未找到教程文件。\n\n"
+					"请在 ui/assets/tutorial.txt 中编写教程内容，然后点击“刷新”。\n"
+				)
+			except Exception as e:
+				content = f"读取教程文件失败：{e}"
+			text.insert("end", content)
+			text.configure(state="disabled")
+
+		_reload()
+
+	def _build_system_settings_dev_page(self, parent: ttk.LabelFrame) -> None:
+		wrapper = ttk.Frame(parent)
+		wrapper.grid(row=0, column=0, sticky="nsew")
+		wrapper.columnconfigure(0, weight=1)
+		wrapper.rowconfigure(2, weight=1)
+
+		intro = (
+			"这里将用于展示：当前版本/变更摘要/调试开关说明/已注入规则快照等开发向信息。\n"
+			"（后续可加入：显示 env hook 状态、快速跳转到 devel_details 文档等）"
+		)
+		ttk.Label(wrapper, text="开发信息", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
+		ttk.Label(wrapper, text=intro, justify="left", foreground="#4b5563").grid(row=1, column=0, sticky="nw")
+
 	def _center_popup_window(self, window: tk.Toplevel) -> None:
 		"""将弹窗居中到主窗口。"""
 		window.update_idletasks()
@@ -5532,11 +6584,17 @@ class MainUI:
 			snap = getattr(env, "_ui_action_settings_snapshot", None)
 			return snap if isinstance(snap, dict) else default_snapshot
 
-		def _step_mod(value: Any) -> int:
+		def _step_mod(_stat_name: str | None, value: Any) -> int:
+			"""读取阶梯值：保持与后端一致，直接使用 env.step_modified_func。"""
+			try:
+				num = int(value)
+			except Exception:
+				num = 0
+
 			step_func = getattr(env, "step_modified_func", None)
 			if callable(step_func):
 				try:
-					return int(step_func(int(value)))
+					return int(step_func(int(num)))
 				except Exception:
 					return 0
 			return 0
@@ -5561,7 +6619,16 @@ class MainUI:
 					return
 				if not bool(getattr(attacker, "is_alive", True)) or int(getattr(attacker, "health", 0)) <= 0:
 					return
-				if not bool(getattr(target, "is_alive", True)) or int(getattr(target, "health", 0)) <= 0:
+				# 濒死系统：濒死（HP=0）目标允许被攻击（“再受伤直接判死”由 test_mock_gameplay 处理）。
+				near_cfg = getattr(env, "_ui_near_death_config", None)
+				near_enabled = bool(near_cfg.get("enabled")) if isinstance(near_cfg, dict) else False
+				attacker_dying = bool(getattr(attacker, "is_dying", False))
+				if attacker_dying and int(getattr(attacker, "health", 0)) <= 0:
+					return
+				target_alive = bool(getattr(target, "is_alive", True))
+				target_hp = int(getattr(target, "health", 0))
+				target_dying = bool(getattr(target, "is_dying", False))
+				if (not target_alive) or (target_hp <= 0 and not (near_enabled and target_dying and target_hp == 0)):
 					return
 				if not bool(getattr(env, "is_in_attack_range", lambda a, t: True)(attacker, target)):
 					return
@@ -5598,11 +6665,16 @@ class MainUI:
 					is_critical = True
 				else:
 					adv = _adv_value(attacker, target)
-					attack_score = float(roll_value) + bonus_flat + coeff_strength * float(_step_mod(getattr(attacker, "strength", 0))) + adv_coeff * float(adv)
+					attack_score = (
+						float(roll_value)
+						+ bonus_flat
+						+ coeff_strength * float(_step_mod("strength", getattr(attacker, "strength", 0)))
+						+ adv_coeff * float(adv)
+					)
 					base_def = float(getattr(target, "physical_resist", 0))
 					attr_def = 0.0
 					if def_attr not in (None, "", "none"):
-						attr_def = float(_step_mod(getattr(target, str(def_attr), 0)))
+						attr_def = float(_step_mod(str(def_attr), getattr(target, str(def_attr), 0)))
 					defense_score = def_base_coeff * base_def + def_attr_coeff * attr_def + def_flat_bonus
 					is_hit = bool(attack_score > defense_score)
 
