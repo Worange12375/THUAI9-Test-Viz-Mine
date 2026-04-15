@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import time
+import contextlib
 import tkinter as tk
 from tkinter import ttk
 from typing import Any, Optional
@@ -23,7 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 
 from env import ActionSet, Area, AttackContext, Environment, PieceArg, Player, Point, SpellContext, SpellFactory
 from logic.controller import Controller
-from logic.test_mock_gameplay import ensure_test_mock_gameplay_installed
+from logic.test_mock_gameplay import ensure_d20_force_installed, ensure_test_mock_gameplay_installed
 from core.events import EventType
 
 from components import (
@@ -123,6 +125,20 @@ class MainUI:
 			"round": tk.BooleanVar(value=True),
 			"important": tk.BooleanVar(value=True),
 		}
+		# 系统设置：投掷结果设置（仅测试端覆盖 d20 返回值，不修改后端算法）。
+		self._D20_FORCE_OPTIONS: list[tuple[str, str]] = [
+			("attack_hit", "攻击命中检定（物理/普通法术）"),
+			("death_check", "死亡检定（HP→0）"),
+			("initiative", "先攻（行动队列）"),
+		]
+		self.system_force_d20_vars: dict[str, tk.BooleanVar] = {
+			key: tk.BooleanVar(value=False) for key, _label in self._D20_FORCE_OPTIONS
+		}
+		self.system_force_d20_flags: dict[str, bool] = {key: False for key, _label in self._D20_FORCE_OPTIONS}
+		self.system_force_d20_value_vars: dict[str, tk.StringVar] = {
+			key: tk.StringVar(value="20") for key, _label in self._D20_FORCE_OPTIONS
+		}
+		self.system_force_d20_values: dict[str, int] = {key: 20 for key, _label in self._D20_FORCE_OPTIONS}
 		# 颜色下拉框目前仅做 UI 预留（不影响渲染），先保留用户选择。
 		self.right_info_category_color_vars: dict[str, tk.StringVar] = {
 			"default": tk.StringVar(value="黑色"),
@@ -179,11 +195,56 @@ class MainUI:
 		# 仅用于“玩法设计-属性/全局”滚动：鼠标位于子控件上时仍能捕获滚轮。
 		self._design_attribute_mousewheel_bind_id: str | None = None
 		self._design_global_mousewheel_bind_id: str | None = None
+		self._design_spell_mousewheel_bind_id: str | None = None
 		# 玩法设计：全局 - 濒死系统（测试端独立玩法）
-		self.design_near_death_enabled_var = tk.BooleanVar(value=False)
+		self.design_near_death_enabled_var = tk.BooleanVar(value=True)
 		self.design_near_death_revive_hp_var = tk.StringVar(value="1")
 		self.design_near_death_turns_to_die_var = tk.IntVar(value=1)
 		self.design_near_death_die_on_damage_var = tk.BooleanVar(value=True)
+		# 濒死状态行动能力（先做 UI + 写入配置；具体落地逻辑后续再做，避免引入新复杂 bug）
+		# 需求：默认改为“不能移动、不能攻击或法术”，并真正落地限制。
+		self.design_near_death_can_move_var = tk.BooleanVar(value=False)
+		self.design_near_death_can_attack_spell_var = tk.BooleanVar(value=False)
+		# 玩法设计：跨局保持（本次 UI 运行期间）。
+		# 现默认启用：濒死系统、测试端法术池（满足“默认开启/默认测试端实现”需求）。
+		self._persistent_near_death_design_config: dict[str, Any] | None = {
+			"near_death": {
+				"enabled": True,
+				"revive_hp_on_20": 1,
+				"turns_to_die": 1,
+				"die_on_damage_when_dying": True,
+				"can_move_when_dying": False,
+				"can_attack_or_spell_when_dying": False,
+			}
+		}
+		self._persistent_spell_pool_design_config: dict[str, Any] | None = {
+			"use_test_spell_impl": True,
+			"spell_priorities": {
+				"WarriorLong": {"arrow_hit": 1, "heal": 2},
+				"WarriorShort": {"trap": 1, "heal": 2},
+				"Archer": {"arrow_hit": 1, "trap": 2},
+				"Mage": {"arrow_hit": 1, "trap": 2, "heal": 3, "teleport": 4, "fireball": 5},
+			},
+		}
+		# 系统设置：已应用快照（用于“关闭并丢弃未应用修改”时回滚）。
+		self._applied_system_general_settings_snapshot: dict[str, Any] | None = None
+		# 系统设置：未应用（dirty）提示与关闭确认。
+		self._system_settings_dirty_flags: dict[str, bool] = {
+			"general": False,
+			"design_global_near_death": False,
+			"design_attribute": False,
+			"design_spell_pool": False,
+		}
+		self._system_settings_dirty_label_vars: dict[str, tk.StringVar] = {}
+		self._system_settings_dirty_trace_bound_sections: set[str] = set()
+		# 玩法设计：法术池配置（职业×法术优先级）
+		# - 优先级取值：0（不选） 或 1~5（优先级，数字越小越优先）
+		# - 与“启用测试端法术默认实现”联动：关闭时走后端实现，表格禁用，仅展示后端默认。
+		self.design_spell_use_test_impl_var = tk.BooleanVar(value=True)
+		self.design_spell_priority_vars: dict[str, dict[str, tk.StringVar]] = {}
+		# 切到“走后端实现”时缓存测试端表格值，避免用户来回切换丢失输入。
+		self._spell_priority_cache_when_test_impl_enabled: dict[str, dict[str, str]] | None = None
+		self._design_spell_use_test_impl_trace_bound = False
 		self.design_global_status_var: tk.StringVar | None = None
 		self.attribute_piece_vars: dict[str, dict[str, tk.StringVar]] = {}
 		self.attribute_piece_entries: dict[str, dict[str, tk.Entry]] = {}
@@ -244,6 +305,7 @@ class MainUI:
 		self.action_confirm_button: ttk.Button | None = None
 		self.action_feedback_label: ttk.Label | None = None
 		self.action_feedback_clear_job: Optional[str] = None
+		self._angel_refresh_job: Optional[str] = None
 		self._rendering_action_mode_body = False
 		self.action_panel_status_label: ttk.Label | None = None
 		self.action_attack_target_var.trace_add("write", lambda *_args: self._refresh_custom_attack_preview())
@@ -358,8 +420,10 @@ class MainUI:
 
 	def _weapon_id_to_profession_label_simple(self, weapon_id: int) -> str:
 		wid = int(weapon_id)
-		if wid in (1, 2):
-			return "战士"
+		if wid == 1:
+			return "战士(长)"
+		if wid == 2:
+			return "战士(短)"
 		if wid == 3:
 			return "射手"
 		if wid == 4:
@@ -1035,6 +1099,21 @@ class MainUI:
 				env = self.controller.environment
 				if env is not None:
 					self._initialize_runtime_environment_with_initiative_capture(env, self.controller.runtime_board_file)
+					try:
+						setattr(env, "_ui_force_d20_flags", dict(getattr(self, "system_force_d20_flags", {})))
+						values: dict[str, int] = {}
+						for k, v in getattr(self, "system_force_d20_value_vars", {}).items():
+							try:
+								val = int(str(v.get()).strip())
+							except Exception:
+								val = 20
+							if val < 1 or val > 20:
+								val = 20
+							values[str(k)] = int(val)
+						setattr(env, "_ui_force_d20_values", values)
+						ensure_d20_force_installed(env)
+					except Exception:
+						pass
 				self._set_runtime_board_all_walkable()
 				self._refresh_board_view()
 				self.runtime_init_config_ready = False
@@ -1052,6 +1131,8 @@ class MainUI:
 					self._apply_runtime_piece_config_to_environment()
 					self._initialize_runtime_card_slots()
 					self._install_runtime_env_deathcheck_hook(env)
+					# 跨局保持：新对局加载后自动重应用“玩法设计”中已应用过的配置。
+					self._reapply_persistent_design_settings_to_runtime_environment(env)
 					self._check_and_announce_runtime_game_over(env, show_dialog=True)
 					self._show_initiative_summary_popup()
 				self.loaded = True
@@ -1070,6 +1151,23 @@ class MainUI:
 				return
 			self.mock_map_height_overrides = {}
 			self.controller.load_game_data(prefer_runtime=False, mock_dataset=self.selected_mock_dataset)
+			env = getattr(self.controller, "environment", None)
+			if env is not None:
+				try:
+					setattr(env, "_ui_force_d20_flags", dict(getattr(self, "system_force_d20_flags", {})))
+					values: dict[str, int] = {}
+					for k, v in getattr(self, "system_force_d20_value_vars", {}).items():
+						try:
+							val = int(str(v.get()).strip())
+						except Exception:
+							val = 20
+						if val < 1 or val > 20:
+							val = 20
+						values[str(k)] = int(val)
+					setattr(env, "_ui_force_d20_values", values)
+					ensure_d20_force_installed(env)
+				except Exception:
+					pass
 			self.runtime_card_slots = []
 			self.mock_card_slots = []
 			self.runtime_piece_slot_binding = {}
@@ -1104,6 +1202,32 @@ class MainUI:
 		if not callable(orig_roll_dice) or not callable(orig_handle):
 			return
 
+		# 防止与 ForceD20 hook 形成递归环：
+		# - 若当前 roll_dice 已是 ForceD20 的外层 hook，则 UI 的记录 hook 不应再把它作为“原始实现”直接调用。
+		# - 否则当 UI 之后再次触发 ensure_d20_force_installed 重新包裹时，可能出现
+		#   ForceD20 -> UI.roll_dice_hook -> ForceD20 的无限递归。
+		try:
+			if bool(getattr(orig_roll_dice, "_ui_force_d20_marker", False)):
+				force_base = getattr(env, "_ui_orig_roll_dice_force_d20", None)
+				if callable(force_base) and force_base is not orig_roll_dice:
+					orig_roll_dice = force_base
+				else:
+					force_base2 = getattr(orig_roll_dice, "_ui_force_d20_orig", None)
+					if callable(force_base2) and force_base2 is not orig_roll_dice:
+						orig_roll_dice = force_base2
+		except Exception:
+			pass
+
+		# 统一入口：UI hook 负责记录/展示；实际判定逻辑通过 _ui_handle_death_check_impl 注入。
+		# 默认 impl 指向后端原实现，测试端濒死系统会把 impl 替换为自己的 hook。
+		try:
+			setattr(env, "_ui_handle_death_check_backend", orig_handle)
+			impl = getattr(env, "_ui_handle_death_check_impl", None)
+			if not callable(impl):
+				setattr(env, "_ui_handle_death_check_impl", orig_handle)
+		except Exception:
+			pass
+
 		def roll_dice_hook(n: int, sides: int):
 			result = orig_roll_dice(n, sides)
 			if bool(getattr(env, "_ui_in_deathcheck", False)) and int(n) == 1 and int(sides) == 20:
@@ -1113,17 +1237,40 @@ class MainUI:
 					setattr(env, "_ui_last_deathcheck_roll", result)
 			return result
 
+		# 供其它 hook（如 ForceD20）识别/解包，避免形成递归环。
+		try:
+			setattr(roll_dice_hook, "_ui_deathcheck_roll_marker", True)
+			setattr(roll_dice_hook, "_ui_deathcheck_roll_orig", orig_roll_dice)
+		except Exception:
+			pass
+
+		def _queue_runtime_message(message: str) -> None:
+			try:
+				pending = getattr(env, "_ui_pending_info_messages", None)
+				if not isinstance(pending, list):
+					pending = []
+					setattr(env, "_ui_pending_info_messages", pending)
+				pending.append(str(message))
+			except Exception:
+				return
+
 		def handle_death_check_hook(target: Any):
 			setattr(env, "_ui_in_deathcheck", True)
 			setattr(env, "_ui_last_deathcheck_roll", None)
 			try:
-				return orig_handle(target)
+				impl = getattr(env, "_ui_handle_death_check_impl", None)
+				if not callable(impl):
+					impl = orig_handle
+				return impl(target)
 			finally:
 				setattr(env, "_ui_in_deathcheck", False)
 				roll_value = getattr(env, "_ui_last_deathcheck_roll", None)
 				piece_code = self._get_piece_short_code(target)
 				if roll_value is None:
-					self.right_info_panel.append_content(f"\n[死亡检定] {piece_code} 触发死亡检定：d20=?")
+					# 某些路径（例如法术/陷阱结算）可能在同一次动作内重复调用死亡检定，
+					# 或由后端逻辑提前 return 导致没有掷 d20。
+					# 这里避免输出“d20=?”这种误导性提示。
+					_queue_runtime_message(f"[死亡检定] {piece_code} 触发死亡检定")
 					return
 				try:
 					roll_int = int(roll_value)
@@ -1131,17 +1278,30 @@ class MainUI:
 					roll_int = None
 
 				if roll_int == 20:
-					self.right_info_panel.append_content(f"\n[死亡检定] {piece_code} 掷 d20=20：恢复至 1HP")
+					try:
+						self._mark_runtime_piece_angel(env, target, seconds=10.0)
+					except Exception:
+						pass
+					_queue_runtime_message(f"[死亡检定] {piece_code} 掷 d20=20：恢复至 1HP")
 				else:
-					# 玩法文档存在“进入濒死”的期望，但当前 env 实现非 20 直接死亡。
-					extra = "（当前实现：非20未进入濒死，直接死亡）" if roll_int is not None else ""
-					self.right_info_panel.append_content(f"\n[死亡检定] {piece_code} 掷 d20={roll_value}{extra}")
+					near_cfg = getattr(env, "_ui_near_death_config", None)
+					near_enabled = bool(near_cfg.get("enabled", False)) if isinstance(near_cfg, dict) else False
+					extra = "（当前实现：非20直接死亡）" if (roll_int is not None and not near_enabled) else ""
+					_queue_runtime_message(f"[死亡检定] {piece_code} 掷 d20={roll_value}{extra}")
 
 		setattr(env, "roll_dice", roll_dice_hook)
 		setattr(env, "handle_death_check", handle_death_check_hook)
+		# 注意：此处覆盖了 env.roll_dice；若系统设置启用了“投掷必定命中”，需要把覆盖再包一层。
+		try:
+			ensure_d20_force_installed(env)
+		except Exception:
+			pass
 
 	def _is_piece_alive_by_hp(self, piece: Any) -> bool:
-		"""统一存活判定：仅 HP>0 视为存活；HP==0 视为死亡。
+		"""统一存活判定。
+
+		- 默认：仅 HP>0 视为存活；HP==0 视为死亡。
+		- 若启用“濒死系统”（测试端注入）：允许出现 HP==0 且 is_dying==True 的“仍存活”状态。
 
 		说明：负 HP 在初始化输入阶段视为非法；在对局结算中若出现负值，这里按 0 处理。
 		"""
@@ -1153,8 +1313,148 @@ class MainUI:
 			hp = 0
 		if hp < 0:
 			hp = 0
-		# 兼容 env 内部 is_alive 字段，但以 HP 为准。
+
+		try:
+			alive_flag = bool(getattr(piece, "is_alive", True))
+		except Exception:
+			alive_flag = True
+		if not alive_flag:
+			return False
+
+		# 濒死系统：HP==0 且 is_dying==True 仍视为“存活”。
+		env = getattr(self.controller, "environment", None)
+		near_cfg = getattr(env, "_ui_near_death_config", None) if env is not None else None
+		near_enabled = bool(near_cfg.get("enabled", False)) if isinstance(near_cfg, dict) else False
+		if near_enabled:
+			try:
+				dy = bool(getattr(piece, "is_dying", False))
+			except Exception:
+				dy = False
+			if dy and hp <= 0:
+				return True
+
 		return hp > 0
+
+	def _flush_runtime_pending_messages(self, env: Any) -> None:
+		if env is None:
+			return
+		try:
+			pending = getattr(env, "_ui_pending_info_messages", None)
+		except Exception:
+			pending = None
+		if not isinstance(pending, list) or not pending:
+			return
+
+		# 濒死/死亡系统消息多用 ID=xx 标记棋子；对玩家不直观。
+		# 这里在 UI flush 时统一把 ID=xx 替换为棋子代号（如 1A、2B）。
+		id_to_code: dict[int, str] = {}
+		try:
+			all_pieces: list[Any] = []
+			all_pieces.extend(self._coerce_piece_list(getattr(getattr(env, "player1", None), "pieces", [])))
+			all_pieces.extend(self._coerce_piece_list(getattr(getattr(env, "player2", None), "pieces", [])))
+			all_pieces.extend(self._coerce_piece_list(getattr(env, "action_queue", [])))
+			for p in all_pieces:
+				if p is None:
+					continue
+				try:
+					pid = int(getattr(p, "id", -1))
+				except Exception:
+					pid = -1
+				if pid < 0 or pid in id_to_code:
+					continue
+				try:
+					code = str(self._get_piece_short_code(p))
+				except Exception:
+					code = ""
+				if code:
+					id_to_code[pid] = code
+		except Exception:
+			id_to_code = {}
+		try:
+			setattr(env, "_ui_pending_info_messages", [])
+		except Exception:
+			pending.clear()
+		# 统一按队列顺序刷到右侧日志。
+		import re
+		id_pat = re.compile(r"\bID=(\-?\d+)\b")
+		for msg in pending:
+			try:
+				text = str(msg)
+				if id_to_code and "ID=" in text:
+					def _rep(m):
+						try:
+							pid2 = int(m.group(1))
+						except Exception:
+							return m.group(0)
+						code2 = id_to_code.get(pid2)
+						return code2 if code2 else m.group(0)
+					text = id_pat.sub(_rep, text)
+				self.right_info_panel.append_content(f"\n{text}")
+			except Exception:
+				continue
+
+	def _mark_runtime_piece_angel(self, env: Any, piece: Any, *, seconds: float) -> None:
+		"""为棋盘角标设置 😇，并安排到期刷新。"""
+		if env is None or piece is None:
+			return
+		try:
+			piece_id = int(getattr(piece, "id", -1))
+		except Exception:
+			piece_id = -1
+		if piece_id < 0:
+			return
+		until_map = getattr(env, "_ui_board_angel_until", None)
+		if not isinstance(until_map, dict):
+			until_map = {}
+			setattr(env, "_ui_board_angel_until", until_map)
+		until_map[piece_id] = float(time.time() + max(0.0, float(seconds)))
+		self._schedule_runtime_angel_refresh(env)
+
+	def _schedule_runtime_angel_refresh(self, env: Any) -> None:
+		"""按最早过期时间安排一次刷新，让 😇 角标自动消失。"""
+		if env is None:
+			return
+		until_map = getattr(env, "_ui_board_angel_until", None)
+		if not isinstance(until_map, dict) or not until_map:
+			return
+		try:
+			now = float(time.time())
+		except Exception:
+			now = 0.0
+		try:
+			min_until = min(float(v) for v in until_map.values() if v is not None)
+		except Exception:
+			return
+		delay_s = max(0.0, min_until - now)
+		delay_ms = max(50, int(delay_s * 1000) + 30)
+		# 取消旧定时器，避免堆积。
+		if self._angel_refresh_job is not None:
+			try:
+				self.root.after_cancel(self._angel_refresh_job)
+			except Exception:
+				pass
+			self._angel_refresh_job = None
+
+		def _do_refresh() -> None:
+			self._angel_refresh_job = None
+			try:
+				if self.root is None or not bool(self.root.winfo_exists()):
+					return
+			except Exception:
+				return
+			try:
+				self._refresh_piece_cards()
+			except Exception:
+				pass
+			try:
+				self._refresh_board_view()
+			except Exception:
+				pass
+
+		try:
+			self._angel_refresh_job = self.root.after(delay_ms, _do_refresh)
+		except Exception:
+			self._angel_refresh_job = None
 
 	def _check_and_announce_runtime_game_over(self, env: Any, *, show_dialog: bool) -> None:
 		"""在 UI 侧主动检查并播报胜负。
@@ -1599,6 +1899,9 @@ class MainUI:
 		current_piece = self._get_runtime_current_piece(env)
 		if current_piece is None:
 			return None, "当前无可行动棋子，请检查对局初始化是否完成"
+		# 濒死行动限制：按玩法设计配置拦截。
+		if self._is_runtime_piece_in_near_death(env, current_piece) and not self._near_death_can_move(env):
+			return None, "濒死状态下不能移动（可在 系统设置→玩法设计→全局 调整）"
 		if int(getattr(current_piece, "action_points", 0)) <= 0:
 			return None, "当前棋子行动位不足"
 
@@ -2080,6 +2383,9 @@ class MainUI:
 					header_text = f"{header_text} [濒死]"
 				hp_cur = int(getattr(piece, "health", 0)) if alive else 0
 				hp_max = int(getattr(piece, "max_health", hp_cur))
+				hp_text = f"{hp_cur}/{hp_max}"
+				if dy and alive and hp_cur <= 0:
+					hp_text = "💀"
 				spell_cur = int(getattr(piece, "spell_slots", 0))
 				spell_max = int(getattr(piece, "max_spell_slots", 0))
 				action_cur = int(getattr(piece, "action_points", 0))
@@ -2093,7 +2399,7 @@ class MainUI:
 				card.set_piece_state(
 					team=team,
 					piece_no=piece_no,
-					hp=f"{hp_cur}/{hp_max}",
+					hp=hp_text,
 					position_text=pos_text,
 					physical_damage=str(int(getattr(piece, "physical_damage", 0))),
 					physical_resist=str(int(getattr(piece, "physical_resist", 0))),
@@ -2268,6 +2574,10 @@ class MainUI:
 		env = self.controller.environment
 		if env is None:
 			return []
+		# 角标：😇 有时效，需要按当前时间判断。
+		now = float(time.time())
+		angel_until = getattr(env, "_ui_board_angel_until", None)
+		angel_map: dict[int, float] = angel_until if isinstance(angel_until, dict) else {}
 		current_piece = self._get_runtime_current_piece(env)
 		current_id = int(getattr(current_piece, "id", -1)) if current_piece is not None else -1
 
@@ -2305,15 +2615,34 @@ class MainUI:
 				base_label = self._get_piece_short_code(piece)
 				role = str(getattr(piece, "type", "") or "").strip()
 				dy = bool(getattr(piece, "is_dying", False))
+				try:
+					hp_now = int(getattr(piece, "health", 0))
+				except Exception:
+					hp_now = 0
 				role_tag = _role_short(role)
-				if role_tag or dy:
-					base_label = f"{base_label}\n{role_tag}{'!' if dy else ''}".rstrip()
+				if role_tag:
+					base_label = f"{base_label}\n{role_tag}".rstrip()
+
+				corner_marker = ""
+				piece_id = int(getattr(piece, "id", -1))
+				until = float(angel_map.get(piece_id, 0.0)) if piece_id >= 0 else 0.0
+				if until and until > now:
+					corner_marker = "😇"
+				elif until and until <= now and piece_id >= 0:
+					try:
+						angel_map.pop(piece_id, None)
+					except Exception:
+						pass
+				# 濒死：常驻 💀（除非被 😇 覆盖）。
+				if not corner_marker and dy and hp_now <= 0 and bool(getattr(piece, "is_alive", True)):
+					corner_marker = "💀"
 				render_pieces.append(
 					{
 						"team": team_id,
 						"x": x,
 						"y": y,
 						"label": base_label,
+						"corner_marker": corner_marker,
 						"is_current": int(getattr(piece, "id", -1)) == current_id,
 					}
 				)
@@ -2493,6 +2822,7 @@ class MainUI:
 					"y": y,
 					"hp": int(getattr(piece, "health", 0)),
 					"alive": bool(getattr(piece, "is_alive", True)),
+					"dy": bool(getattr(piece, "is_dying", False)),
 				}
 		return states
 
@@ -2535,10 +2865,14 @@ class MainUI:
 			new_hp = int(after_state.get("hp", 0))
 			if old_hp != new_hp:
 				delta = old_hp - new_hp
+				old_dy = bool(before_state.get("dy", False))
+				new_dy = bool(after_state.get("dy", False))
+				old_text = "💀" if old_dy and int(old_hp) <= 0 and bool(before_state.get("alive", True)) else str(old_hp)
+				new_text = "💀" if new_dy and int(new_hp) <= 0 and bool(after_state.get("alive", True)) else str(new_hp)
 				if delta > 0:
-					team_lines[team].append(f"{piece_name} 血量变化: {old_hp} -> {new_hp} (受到伤害 {delta})")
+					team_lines[team].append(f"{piece_name} 血量变化: {old_text} -> {new_text} (受到伤害 {delta})")
 				else:
-					team_lines[team].append(f"{piece_name} 血量变化: {old_hp} -> {new_hp}")
+					team_lines[team].append(f"{piece_name} 血量变化: {old_text} -> {new_text}")
 
 		self.right_info_panel.append_content(f"\n[回合 {round_number} 详细信息]")
 		for team in (1, 2):
@@ -2556,6 +2890,9 @@ class MainUI:
 			after_states = self._snapshot_runtime_piece_states()
 			round_number = int(getattr(env, "round_number", 0))
 			self._append_runtime_round_details(round_number, runtime_before_states or {}, after_states)
+			# 将运行时 hook 产生的系统消息（例如：濒死列表倒计时/超时死亡）及时刷到右侧信息区。
+			# 否则消息会一直堆在 env._ui_pending_info_messages，导致看起来“没实现”。
+			self._flush_runtime_pending_messages(env)
 			return
 
 		round_number = int(self.controller.current_round)
@@ -2643,6 +2980,11 @@ class MainUI:
 			# 🎯 目标标记（只在可执行的锁定行动下展示）
 			if hasattr(self.left_board_panel, "set_target_markers"):
 				self.left_board_panel.set_target_markers(target_markers)
+			# 让 😇 角标能按时消失。
+			try:
+				self._schedule_runtime_angel_refresh(self.controller.environment)
+			except Exception:
+				pass
 			return
 
 		game_data = self.controller.game_data
@@ -2684,22 +3026,12 @@ class MainUI:
 			target_piece = self._resolve_action_target_piece(target_label)
 			if target_piece is None:
 				return []
-			attack_type = (self.action_attack_type_var.get().strip() or "物理攻击")
-			# 定制攻击也视为“锁定行动”，但仍按用户期望要求 AP 且要求输入合法。
-			if attack_type == "定制攻击":
-				try:
-					custom_damage = int(self.action_custom_damage_var.get().strip())
-				except Exception:
+			try:
+				if not bool(env.is_in_attack_range(actor, target_piece)):
 					return []
-				if custom_damage <= 0:
-					return []
-			else:
-				try:
-					if not bool(env.is_in_attack_range(actor, target_piece)):
-						return []
-				except Exception:
-					# 若后端环境不支持该判断，则不绘制（避免误导）。
-					return []
+			except Exception:
+				# 若后端环境不支持该判断，则不绘制（避免误导）。
+				return []
 
 			pos = getattr(target_piece, "position", None)
 			x = int(getattr(pos, "x", -1)) if pos is not None else -1
@@ -3914,6 +4246,8 @@ class MainUI:
 		env = self.controller.environment
 		if env is None:
 			return
+		# 保证日志顺序：先输出行动记录/公式，再输出死亡检定/濒死提示。
+		self._flush_runtime_pending_messages(env)
 		if target_piece is not None and (not self._is_piece_alive_by_hp(target_piece)):
 			self.right_info_panel.append_content(f"\n棋子 {target_code} 已死亡")
 		self._check_and_announce_runtime_game_over(env, show_dialog=True)
@@ -4059,6 +4393,11 @@ class MainUI:
 			if current_piece is None:
 				self._set_action_feedback("行动失败：未定位到当前行动棋子", False)
 				return
+			# 濒死行动限制：按玩法设计配置拦截。
+			if self._is_runtime_piece_in_near_death(env, current_piece) and not self._near_death_can_move(env):
+				self._set_action_feedback("行动失败：濒死状态下不能移动", False)
+				self.right_info_panel.append_content("\n[UI] 移动提交失败：濒死状态下不能移动")
+				return
 
 			old_pos = getattr(current_piece, "position", None)
 			old_x = int(getattr(old_pos, "x", -1)) if old_pos is not None else -1
@@ -4103,16 +4442,44 @@ class MainUI:
 			self._update_cards_from_env()
 			self._refresh_piece_cards()
 			self._refresh_board_view()
+			# 显示本次动作触发的濒死/死亡系统消息（不依赖回合结束 flush）。
+			try:
+				self._flush_runtime_pending_messages(env)
+			except Exception:
+				pass
 			return
 		elif mode == "attack":
 			env = self.controller.environment
 			if env is None:
 				self._set_action_feedback("行动失败：环境未初始化", False)
 				return
+			# 确保测试端玩法 hooks 已安装：濒死系统的判定逻辑仅来自 dev_test/logic/test_mock_gameplay.py。
+			# 避免未安装 hooks 时落回后端 handle_death_check（后端实现不支持濒死分支）。
+			try:
+				def _queue_house_rule_msg(msg: str) -> None:
+					try:
+						pending = getattr(env, "_ui_pending_info_messages", None)
+						if not isinstance(pending, list):
+							pending = []
+							setattr(env, "_ui_pending_info_messages", pending)
+						pending.append(str(msg))
+					except Exception:
+						return
+				ensure_test_mock_gameplay_installed(env, logger=_queue_house_rule_msg)
+			except Exception:
+				try:
+					ensure_test_mock_gameplay_installed(env)
+				except Exception:
+					pass
 
 			current_piece = self._get_runtime_current_piece(env)
 			if current_piece is None:
 				self._set_action_feedback("行动失败：未定位到当前行动棋子", False)
+				return
+			# 濒死行动限制：按玩法设计配置拦截。
+			if self._is_runtime_piece_in_near_death(env, current_piece) and not self._near_death_can_act(env):
+				self._set_action_feedback("行动失败：濒死状态下不能攻击或法术", False)
+				self.right_info_panel.append_content("\n[UI] 攻击提交失败：濒死状态下不能攻击或法术")
 				return
 
 			target_label = self.action_attack_target_var.get().strip()
@@ -4152,6 +4519,10 @@ class MainUI:
 				self._update_cards_from_env()
 				self._refresh_piece_cards()
 				self._refresh_board_view()
+				try:
+					self._flush_runtime_pending_messages(env)
+				except Exception:
+					pass
 				return
 
 			if int(getattr(current_piece, "action_points", 0)) <= 0:
@@ -4199,7 +4570,18 @@ class MainUI:
 					def _roll_proxy(n: int, sides: int):
 						value = original_roll(n, sides)
 						if int(n) == 1 and int(sides) == 20:
-							captured_rolls.append(int(value))
+							try:
+								iv = int(value)
+							except Exception:
+								iv = 0
+							captured_rolls.append(iv)
+							# 兼容“死亡检定 UI hook”：其 roll_dice_hook 依赖 _ui_in_deathcheck 才会写入 _ui_last_deathcheck_roll。
+							# 但这里临时替换了 env.roll_dice，会绕过那层记录逻辑，导致右侧显示 d20=?。
+							if bool(getattr(env, "_ui_in_deathcheck", False)):
+								try:
+									setattr(env, "_ui_last_deathcheck_roll", int(iv))
+								except Exception:
+									pass
 						return value
 					setattr(env, "roll_dice", _roll_proxy)
 					wrapped_roll = True
@@ -4317,7 +4699,19 @@ class MainUI:
 				current_piece.get_accessor().change_action_points_by(-1)
 
 			new_ap = int(getattr(current_piece, "action_points", 0))
-			new_hp = int(getattr(target_piece, "health", 0))
+			try:
+				new_hp = int(getattr(target_piece, "health", 0))
+			except Exception:
+				new_hp = 0
+			if new_hp < 0:
+				try:
+					target_piece.get_accessor().set_health_to(0)
+				except Exception:
+					try:
+						setattr(target_piece, "health", 0)
+					except Exception:
+						pass
+				new_hp = 0
 			real_damage = max(0, old_hp - new_hp)
 
 			# 命中与否不能用 raw_damage>0 推断（基础伤害可能为 0）。
@@ -4348,16 +4742,26 @@ class MainUI:
 			self._update_cards_from_env()
 			self._refresh_piece_cards()
 			self._refresh_board_view()
+			try:
+				self._flush_runtime_pending_messages(env)
+			except Exception:
+				pass
 			return
 		else:
 			env = self.controller.environment
 			if env is None:
 				self._set_action_feedback("行动失败：环境未初始化", False)
 				return
+			ensure_test_mock_gameplay_installed(env)
 
 			caster = self._get_runtime_current_piece(env)
 			if caster is None:
 				self._set_action_feedback("行动失败：未定位到当前行动棋子", False)
+				return
+			# 濒死行动限制：按玩法设计配置拦截。
+			if self._is_runtime_piece_in_near_death(env, caster) and not self._near_death_can_act(env):
+				self._set_action_feedback("行动失败：濒死状态下不能攻击或法术", False)
+				self.right_info_panel.append_content("\n[UI] 法术提交失败：濒死状态下不能攻击或法术")
 				return
 
 			spell = self._resolve_selected_spell()
@@ -4410,6 +4814,10 @@ class MainUI:
 				self._update_cards_from_env()
 				self._refresh_piece_cards()
 				self._refresh_board_view()
+				try:
+					self._flush_runtime_pending_messages(env)
+				except Exception:
+					pass
 				return
 
 			if is_trap_spell:
@@ -4428,6 +4836,10 @@ class MainUI:
 				self._update_cards_from_env()
 				self._refresh_piece_cards()
 				self._refresh_board_view()
+				try:
+					self._flush_runtime_pending_messages(env)
+				except Exception:
+					pass
 				return
 
 			if is_locking_spell:
@@ -4520,15 +4932,19 @@ class MainUI:
 				code = self._get_piece_short_code(p)
 				old_hp = before_hp.get(id(p), int(getattr(p, "health", 0)))
 				new_hp = int(getattr(p, "health", 0))
+				alive_flag = bool(getattr(p, "is_alive", True))
+				dy_flag = bool(getattr(p, "is_dying", False))
+				old_text = "💀" if dy_flag and int(old_hp) <= 0 and alive_flag else str(old_hp)
+				new_text = "💀" if dy_flag and int(new_hp) <= 0 and alive_flag else str(new_hp)
 				delta = int(old_hp - new_hp)
 				if delta > 0:
 					self.right_info_panel.append_content(
-						f"\n[公式] 结算：{spell_name} 对 {code} 造成 {delta} 点伤害（HP {old_hp}->{new_hp}）"
+						f"\n[公式] 结算：{spell_name} 对 {code} 造成 {delta} 点伤害（HP {old_text}->{new_text}）"
 					)
 				elif delta < 0:
 					heal = -delta
 					self.right_info_panel.append_content(
-						f"\n[公式] 结算：{spell_name} 为 {code} 恢复 {heal} 点生命（HP {old_hp}->{new_hp}）"
+						f"\n[公式] 结算：{spell_name} 为 {code} 恢复 {heal} 点生命（HP {old_text}->{new_text}）"
 					)
 				if new_hp < 0:
 					try:
@@ -4536,8 +4952,19 @@ class MainUI:
 					except Exception:
 						setattr(p, "health", 0)
 					new_hp = 0
-				if new_hp == 0:
-					self._handle_death_check_if_possible(env, p)
+				# 仅在“从 >0 降到 0”时兜底触发死亡检定，避免对已濒死(0HP)目标重复触发。
+				if new_hp == 0 and int(old_hp) > 0:
+					# 若后端在 execute_player_action 内已触发死亡检定并进入濒死/死亡，则不要重复触发。
+					try:
+						already_dying = bool(getattr(p, "is_dying", False)) and int(getattr(p, "health", 0)) <= 0
+					except Exception:
+						already_dying = False
+					try:
+						alive_flag = bool(getattr(p, "is_alive", True))
+					except Exception:
+						alive_flag = True
+					if not already_dying and alive_flag:
+						self._handle_death_check_if_possible(env, p)
 
 			summary_targets = ",".join(target_codes) if target_codes else "无"
 			summary = f"目标[{summary_targets}]，AP {old_ap}->{new_ap}，SP {old_sp}->{new_sp}"
@@ -4568,6 +4995,10 @@ class MainUI:
 			self._update_cards_from_env()
 			self._refresh_piece_cards()
 			self._refresh_board_view()
+			try:
+				self._flush_runtime_pending_messages(env)
+			except Exception:
+				pass
 			return
 
 		self.right_info_panel.append_content(f"\n{message}")
@@ -4622,6 +5053,19 @@ class MainUI:
 			self._try_trigger_runtime_trap_on_piece(env, ended_piece, reason="行动完毕触发")
 
 		self._tick_runtime_traps(env, round_advanced=round_advanced)
+
+		# 濒死系统：倒计时口径=行动队列推进一次（相当于一个“回合/turn”）。
+		# UI 的手动行动不会调用 env.step，因此在“行动完毕”这里手动推进一次。
+		try:
+			ensure_test_mock_gameplay_installed(env)
+			tick = getattr(env, "_ui_near_death_tick", None)
+			if callable(tick):
+				tick("end_turn")
+			self._flush_runtime_pending_messages(env)
+			# tick 可能导致棋子死亡（例如濒死超时），需要立刻结算胜负。
+			self._check_and_announce_runtime_game_over(env, show_dialog=True)
+		except Exception:
+			pass
 
 		self._append_runtime_turn_round_status()
 
@@ -4874,6 +5318,368 @@ class MainUI:
 		if force_runtime_init:
 			self.root.wait_window(window)
 
+	def _set_system_settings_dirty(self, section: str, dirty: bool) -> None:
+		# dirty 屏障：内部同步/回滚/初始化时，不应触发“写入即脏”。
+		# 说明：通常 dirty=True 来自 trace 回调；dirty=False 来自显式 apply/回滚。
+		try:
+			suppress_depth = int(getattr(self, "_system_settings_dirty_suppress_depth", 0) or 0)
+		except Exception:
+			suppress_depth = 0
+		if bool(dirty) and suppress_depth > 0:
+			return
+		flags = getattr(self, "_system_settings_dirty_flags", None)
+		if not isinstance(flags, dict):
+			return
+		flags[str(section)] = bool(dirty)
+		label_vars = getattr(self, "_system_settings_dirty_label_vars", None)
+		if not isinstance(label_vars, dict):
+			return
+		var = label_vars.get(str(section))
+		if var is not None:
+			try:
+				var.set("（未应用）" if dirty else "")
+			except Exception:
+				pass
+
+	@contextlib.contextmanager
+	def _suppress_system_settings_dirty(self) -> Any:
+		"""暂时抑制 system_settings 的 dirty 标记（用于内部同步/回滚/初始化）。"""
+		try:
+			self._system_settings_dirty_suppress_depth = int(getattr(self, "_system_settings_dirty_suppress_depth", 0) or 0) + 1
+		except Exception:
+			self._system_settings_dirty_suppress_depth = 1
+		try:
+			yield
+		finally:
+			try:
+				self._system_settings_dirty_suppress_depth = max(0, int(getattr(self, "_system_settings_dirty_suppress_depth", 1) or 1) - 1)
+			except Exception:
+				self._system_settings_dirty_suppress_depth = 0
+
+	def _suppress_system_settings_dirty_until_idle(self) -> None:
+		"""抑制 dirty 直到下一次 Tk idle。
+
+		用于解决“页面构建/控件创建时，控件内部会延迟写回 Variable 导致 trace 误触发”问题。
+		"""
+		try:
+			self._system_settings_dirty_suppress_depth = int(getattr(self, "_system_settings_dirty_suppress_depth", 0) or 0) + 1
+		except Exception:
+			self._system_settings_dirty_suppress_depth = 1
+
+		def _release() -> None:
+			try:
+				self._system_settings_dirty_suppress_depth = max(
+					0,
+					int(getattr(self, "_system_settings_dirty_suppress_depth", 1) or 1) - 1,
+				)
+			except Exception:
+				self._system_settings_dirty_suppress_depth = 0
+
+		try:
+			self.root.after_idle(_release)
+		except Exception:
+			_release()
+
+	def _has_any_system_settings_dirty(self) -> bool:
+		flags = getattr(self, "_system_settings_dirty_flags", None)
+		if not isinstance(flags, dict):
+			return False
+		return any(bool(v) for v in flags.values())
+
+	def _show_confirm_dialog(self, title: str, message: str, yes_text: str = "确定", no_text: str = "取消") -> bool:
+		"""显示一个简单的“是/否”确认弹窗，返回是否选择 yes。"""
+		choice: dict[str, bool] = {"value": False}
+		window = tk.Toplevel(self.root)
+		window.title(title)
+		window.transient(self.root)
+		window.resizable(False, False)
+		window.grab_set()
+
+		frame = ttk.Frame(window, padding=12)
+		frame.pack(fill="both", expand=True)
+		ttk.Label(frame, text=message, justify="left").pack(anchor="w")
+
+		button_row = ttk.Frame(frame)
+		button_row.pack(fill="x", pady=(10, 0))
+
+		def on_yes() -> None:
+			choice["value"] = True
+			window.destroy()
+
+		def on_no() -> None:
+			choice["value"] = False
+			window.destroy()
+
+		ttk.Button(button_row, text=no_text, command=on_no).pack(side="right")
+		ttk.Button(button_row, text=yes_text, command=on_yes).pack(side="right", padx=(0, 6))
+
+		window.protocol("WM_DELETE_WINDOW", on_no)
+		self._center_popup_window(window)
+		self.root.wait_window(window)
+		return bool(choice["value"])
+
+	def _get_runtime_near_death_cfg(self, env: Any) -> dict[str, Any]:
+		cfg = getattr(env, "_ui_near_death_config", None)
+		return cfg if isinstance(cfg, dict) else {}
+
+	def _is_runtime_piece_in_near_death(self, env: Any, piece: Any) -> bool:
+		if env is None or piece is None:
+			return False
+		cfg = self._get_runtime_near_death_cfg(env)
+		if not bool(cfg.get("enabled", False)):
+			return False
+		try:
+			is_dying = bool(getattr(piece, "is_dying", False))
+			hp = int(getattr(piece, "health", 0))
+			alive = bool(getattr(piece, "is_alive", True))
+		except Exception:
+			return False
+		return bool(is_dying and alive and hp <= 0)
+
+	def _near_death_can_move(self, env: Any) -> bool:
+		cfg = self._get_runtime_near_death_cfg(env)
+		return bool(cfg.get("can_move_when_dying", False))
+
+	def _near_death_can_act(self, env: Any) -> bool:
+		cfg = self._get_runtime_near_death_cfg(env)
+		return bool(cfg.get("can_attack_or_spell_when_dying", False))
+
+	def _reapply_persistent_design_settings_to_runtime_environment(self, env: Any) -> None:
+		"""新对局加载后自动重应用（跨局保持）的玩法设计配置。"""
+		if env is None or self.controller.runtime_source != "runtime_env":
+			return
+		try:
+			if isinstance(getattr(self, "_persistent_near_death_design_config", None), dict):
+				self._apply_near_death_config_to_runtime_environment(self._persistent_near_death_design_config or {})
+				self.right_info_panel.append_content("\n[UI] 已自动重应用：濒死系统配置（跨局保持）")
+		except Exception:
+			pass
+		try:
+			if isinstance(getattr(self, "_persistent_spell_pool_design_config", None), dict):
+				self._apply_spell_pool_config_to_runtime_environment(self._persistent_spell_pool_design_config or {})
+				self.right_info_panel.append_content("\n[UI] 已自动重应用：法术池配置（跨局保持）")
+		except Exception:
+			pass
+
+	def _apply_spell_pool_config_to_runtime_environment(self, config: dict[str, Any]) -> bool:
+		if self.controller.runtime_source != "runtime_env":
+			return False
+		env = getattr(self.controller, "environment", None)
+		if env is None:
+			return False
+		use_test = True
+		try:
+			use_test = bool(config.get("use_test_spell_impl", True)) if isinstance(config, dict) else True
+		except Exception:
+			use_test = True
+		priorities = config.get("spell_priorities", {}) if isinstance(config, dict) else {}
+		if not isinstance(priorities, dict):
+			priorities = {}
+		setattr(env, "_ui_use_test_spell_impl", bool(use_test))
+		setattr(env, "_ui_spell_priorities_config", copy.deepcopy(priorities))
+
+		def _normalize_spell_key(name: str) -> str:
+			key = str(name or "").strip().lower()
+			key = key.replace(" ", "")
+			if key in ("arrowhit", "arrow_hit"):
+				return "arrow_hit"
+			if key == "fireball":
+				return "fireball"
+			if key == "trap":
+				return "trap"
+			if key == "heal":
+				return "heal"
+			if key in ("teleport", "move"):
+				return "teleport"
+			return key
+
+		def _get_spell_order_keys_fixed() -> list[str]:
+			"""行动下拉展示顺序：与玩法设计表格纵轴一致（固定顺序）。
+
+			当前显示：箭击 -> 陷阱 -> 治愈 -> 瞬移 -> 火球。
+			未来新法术可在此处扩展（先不在 UI 中显示）。
+			"""
+			# TODO: future spells (reserved)
+			return ["arrow_hit", "trap", "heal", "teleport", "fireball"]
+
+		setattr(env, "_ui_spell_order_keys", _get_spell_order_keys_fixed())
+
+		orig_fetcher = getattr(env, "get_available_spells", None)
+		if callable(orig_fetcher) and not bool(getattr(orig_fetcher, "_ui_spell_pool_marker", False)):
+			setattr(env, "_ui_orig_get_available_spells_spell_pool", orig_fetcher)
+
+		def get_available_spells_hook(piece: Any = None) -> list[Any]:
+			# 与后端 env.get_available_spells 行为对齐：piece=None 则默认 current_piece。
+			if piece is None:
+				piece = getattr(env, "current_piece", None)
+			if piece is None or not bool(getattr(piece, "is_alive", True)):
+				return []
+
+			def _get_piece_weapon_id(p: Any) -> int | None:
+				for attr in ("weapon_id", "weaponId", "weapon", "weapon_type", "weaponType"):
+					if hasattr(p, attr):
+						try:
+							return int(getattr(p, attr))
+						except Exception:
+							pass
+				eq = getattr(p, "equip", None)
+				if eq is not None:
+					for attr in ("x", "X"):
+						if hasattr(eq, attr):
+							try:
+								return int(getattr(eq, attr))
+							except Exception:
+								pass
+					try:
+						if isinstance(eq, (tuple, list)) and len(eq) >= 1:
+							return int(eq[0])
+					except Exception:
+						pass
+				return None
+
+			def _get_prof_key(p: Any) -> str:
+				t = str(getattr(p, "type", "") or "").strip()
+				if t in ("WarriorLong", "WarriorShort", "Archer", "Mage"):
+					return t
+				wid = _get_piece_weapon_id(p)
+				if wid == 1:
+					return "WarriorLong"
+				if wid == 2:
+					return "WarriorShort"
+				if wid == 3:
+					return "Archer"
+				if wid == 4:
+					return "Mage"
+				if t == "Warrior":
+					return "WarriorLong"
+				if t in ("Archer", "Mage"):
+					return t
+				return t or "Unknown"
+
+			def _apply_action_spell_overrides(spells: list[Any]) -> list[Any]:
+				"""与“行动属性-法术覆盖”兼容：若本局已应用 spell_overrides，则对返回法术做属性覆写。"""
+				try:
+					snap = getattr(env, "_ui_action_settings_snapshot", None)
+					if not isinstance(snap, dict):
+						return spells
+					overrides = snap.get("spell_overrides", {})
+					if not isinstance(overrides, dict) or not overrides:
+						return spells
+				except Exception:
+					return spells
+				out: list[Any] = []
+				for spell in spells:
+					try:
+						sid = getattr(spell, "id", None)
+						key1 = str(sid) if sid is not None else ""
+						override = overrides.get(key1) or overrides.get(sid)
+						if not isinstance(override, dict):
+							out.append(spell)
+							continue
+						try:
+							new_spell = copy.copy(spell)
+						except Exception:
+							new_spell = spell
+						for k, attr_name in (
+							("base_value", "base_value"),
+							("range", "range"),
+							("area_radius", "area_radius"),
+							("spell_cost", "spell_cost"),
+							("base_lifespan", "base_lifespan"),
+						):
+							if k not in override:
+								continue
+							try:
+								setattr(new_spell, attr_name, int(float(override.get(k))))
+							except Exception:
+								pass
+						out.append(new_spell)
+					except Exception:
+						out.append(spell)
+				return out
+
+			# 模式 1：走后端实现（直接委托原逻辑）
+			if not bool(getattr(env, "_ui_use_test_spell_impl", True)):
+				orig = getattr(env, "_ui_orig_get_available_spells_spell_pool", None)
+				base = list(orig(piece)) if callable(orig) else SpellFactory.get_available_spells(piece)
+				return _apply_action_spell_overrides(base)
+
+			# 模式 2：测试端独立实现（优先级 + 智力上限）
+			prof_key = _get_prof_key(piece)
+			priorities_cfg = getattr(env, "_ui_spell_priorities_config", None)
+			if not isinstance(priorities_cfg, dict):
+				priorities_cfg = {}
+
+			default_test_priorities: dict[str, dict[str, int]] = {
+				"WarriorLong": {"arrow_hit": 1, "heal": 2},
+				"WarriorShort": {"trap": 1, "heal": 2},
+				"Archer": {"arrow_hit": 1, "trap": 2},
+				"Mage": {"arrow_hit": 1, "trap": 2, "heal": 3, "teleport": 4, "fireball": 5},
+			}
+
+			# 若未提供任何优先级配置，则使用测试端默认池（避免空配置导致下拉为空）。
+			if not priorities_cfg:
+				priorities_cfg = default_test_priorities
+
+			prof_map = priorities_cfg.get(prof_key, {}) if isinstance(priorities_cfg.get(prof_key, {}), dict) else {}
+			if not prof_map:
+				prof_map = default_test_priorities.get(prof_key, {})
+			# build key->spell
+			all_spells = list(SpellFactory.get_all_spells())
+			spell_by_key: dict[str, Any] = {}
+			for sp in all_spells:
+				k = _normalize_spell_key(str(getattr(sp, "name", "")))
+				if k and k not in spell_by_key:
+					spell_by_key[k] = sp
+			order_keys = getattr(env, "_ui_spell_order_keys", None)
+			if not isinstance(order_keys, list) or not order_keys:
+				order_keys = _get_spell_order_keys_fixed()
+			# candidates
+			candidates: list[str] = []
+			for k, raw_pri in prof_map.items():
+				try:
+					pri = int(raw_pri)
+				except Exception:
+					pri = 0
+				if pri > 0 and k in spell_by_key:
+					candidates.append(str(k))
+			if not candidates:
+				return []
+			# N by intelligence
+			try:
+				intel = int(getattr(piece, "intelligence", 0) or 0)
+			except Exception:
+				intel = 0
+			intel = max(0, int(intel))
+			is_mage = (prof_key == "Mage") or (str(getattr(piece, "type", "")).strip() == "Mage")
+			if is_mage:
+				max_spells = 2 * (intel // 4) + 1
+			else:
+				max_spells = (intel // 4) + 1
+			max_spells = max(1, int(max_spells))
+
+			idx: dict[str, int] = {str(k): i for i, k in enumerate(order_keys)}
+			def _sort_key(k: str) -> tuple[int, int]:
+				try:
+					pri = int(prof_map.get(k, 0))
+				except Exception:
+					pri = 0
+				# 数字越小优先级越高；相同优先级按表格行顺序稳定排序。
+				return (pri, idx.get(k, 10**9))
+			sorted_keys = sorted(candidates, key=_sort_key)
+			selected_set = set(sorted_keys[: max_spells])
+			base: list[Any] = [spell_by_key[k] for k in order_keys if k in selected_set]
+			return _apply_action_spell_overrides(base)
+
+		setattr(get_available_spells_hook, "_ui_spell_pool_marker", True)
+		setattr(env, "get_available_spells", get_available_spells_hook)
+		# 立即刷新行动面板“法术”模式下的下拉框
+		try:
+			self._rerender_spell_mode_if_needed()
+		except Exception:
+			pass
+		return True
+
 	def _on_click_system_settings(self) -> None:
 		"""打开系统设置窗口（框架）。
 
@@ -4895,6 +5701,15 @@ class MainUI:
 					return
 			except Exception:
 				pass
+
+		# 关闭系统设置时若存在“未应用（dirty）”修改：按产品约定应自动还原（丢弃未应用）。
+		# 注意：综合设置页可能在本次 UI 进程中从未点击过“应用”，因此这里需要建立基线快照，
+		# 否则“关闭并丢弃”无法回滚到进入窗口前的状态。
+		try:
+			if not isinstance(getattr(self, "_applied_system_general_settings_snapshot", None), dict):
+				self._applied_system_general_settings_snapshot = self._collect_system_general_settings_snapshot_from_vars()
+		except Exception:
+			pass
 
 		window = tk.Toplevel(self.root)
 		window.title("系统设置")
@@ -4933,14 +5748,220 @@ class MainUI:
 			self.system_settings_nav_buttons[page_key] = btn
 
 		def on_close() -> None:
+			# 若存在未应用修改：提示确认。
+			try:
+				if self._has_any_system_settings_dirty():
+					ok = self._show_confirm_dialog(
+						"提示",
+						"系统设置存在未应用的修改。\n确定关闭并丢弃这些未应用的修改吗？",
+						yes_text="关闭",
+						no_text="返回",
+					)
+					if not ok:
+						return
+					# 选择“关闭”：回滚到最近一次已应用的状态，并清空 dirty 标记。
+					self._discard_unapplied_system_settings_changes()
+			except Exception:
+				pass
 			self.system_settings_window = None
 			self.system_settings_content_frame = None
 			self.system_settings_nav_buttons = {}
+			try:
+				self._system_settings_dirty_label_vars = {}
+			except Exception:
+				pass
 			window.destroy()
 
 		window.protocol("WM_DELETE_WINDOW", on_close)
 		self._center_popup_window(window)
 		self._switch_system_settings_page("general")
+
+	def _collect_system_general_settings_snapshot_from_vars(self) -> dict[str, Any]:
+		"""采集综合设置页变量快照（用于回滚/重开窗口保持一致性）。"""
+		visibility: dict[str, bool] = {}
+		colors: dict[str, str] = {}
+		force_flags: dict[str, bool] = {}
+		force_values: dict[str, str] = {}
+		try:
+			for k, v in getattr(self, "right_info_category_visibility_vars", {}).items():
+				try:
+					visibility[str(k)] = bool(v.get())
+				except Exception:
+					visibility[str(k)] = False
+		except Exception:
+			pass
+		try:
+			for k, v in getattr(self, "right_info_category_color_vars", {}).items():
+				try:
+					colors[str(k)] = str(v.get())
+				except Exception:
+					colors[str(k)] = ""
+		except Exception:
+			pass
+		try:
+			for k, v in getattr(self, "system_force_d20_vars", {}).items():
+				try:
+					force_flags[str(k)] = bool(v.get())
+				except Exception:
+					force_flags[str(k)] = False
+		except Exception:
+			pass
+		try:
+			for k, v in getattr(self, "system_force_d20_value_vars", {}).items():
+				try:
+					force_values[str(k)] = str(v.get())
+				except Exception:
+					force_values[str(k)] = ""
+		except Exception:
+			pass
+		return {
+			"visibility": visibility,
+			"colors": colors,
+			"force_flags": force_flags,
+			"force_values": force_values,
+		}
+
+	def _apply_system_general_settings_snapshot_to_vars(self, snapshot: dict[str, Any]) -> None:
+		if not isinstance(snapshot, dict):
+			return
+		vis = snapshot.get("visibility")
+		cols = snapshot.get("colors")
+		flags = snapshot.get("force_flags")
+		vals = snapshot.get("force_values")
+		try:
+			if isinstance(vis, dict):
+				for k, value in vis.items():
+					var = getattr(self, "right_info_category_visibility_vars", {}).get(k)
+					if var is not None:
+						try:
+							var.set(bool(value))
+						except Exception:
+							pass
+		except Exception:
+			pass
+		try:
+			if isinstance(cols, dict):
+				for k, value in cols.items():
+					var = getattr(self, "right_info_category_color_vars", {}).get(k)
+					if var is not None:
+						try:
+							var.set(str(value))
+						except Exception:
+							pass
+		except Exception:
+			pass
+		try:
+			if isinstance(flags, dict):
+				for k, value in flags.items():
+					var = getattr(self, "system_force_d20_vars", {}).get(k)
+					if var is not None:
+						try:
+							var.set(bool(value))
+						except Exception:
+							pass
+		except Exception:
+			pass
+		try:
+			if isinstance(vals, dict):
+				for k, value in vals.items():
+					var = getattr(self, "system_force_d20_value_vars", {}).get(k)
+					if var is not None:
+						try:
+							var.set(str(value))
+						except Exception:
+							pass
+		except Exception:
+			pass
+
+	def _discard_unapplied_system_settings_changes(self) -> None:
+		"""回滚系统设置中未应用的修改，并清空 dirty 状态。
+
+		说明：系统设置窗口是可反复打开/切换页面的；变量存放在 MainUI 实例上，
+		若关闭时不回滚会导致“关闭并丢弃”后仍残留修改或下次打开仍显示“（未应用）”。
+		"""
+		flags = getattr(self, "_system_settings_dirty_flags", None)
+		if not isinstance(flags, dict) or not flags:
+			return
+
+		with self._suppress_system_settings_dirty():
+			# 综合设置
+			try:
+				if bool(flags.get("general", False)) and isinstance(
+					getattr(self, "_applied_system_general_settings_snapshot", None), dict
+				):
+					self._apply_system_general_settings_snapshot_to_vars(self._applied_system_general_settings_snapshot or {})
+			except Exception:
+				pass
+
+			# 玩法设计-全局：濒死系统
+			try:
+				if bool(flags.get("design_global_near_death", False)):
+					cfg = getattr(self, "_persistent_near_death_design_config", None)
+					near = cfg.get("near_death", {}) if isinstance(cfg, dict) else {}
+					if not isinstance(near, dict):
+						near = {}
+					self.design_near_death_enabled_var.set(bool(near.get("enabled", False)))
+					revive_hp = near.get("revive_hp_on_20", 1)
+					self.design_near_death_revive_hp_var.set(str(revive_hp if revive_hp is not None else 1))
+					try:
+						self.design_near_death_turns_to_die_var.set(int(near.get("turns_to_die", 1)))
+					except Exception:
+						self.design_near_death_turns_to_die_var.set(1)
+					self.design_near_death_die_on_damage_var.set(bool(near.get("die_on_damage_when_dying", True)))
+					self.design_near_death_can_move_var.set(bool(near.get("can_move_when_dying", False)))
+					self.design_near_death_can_attack_spell_var.set(bool(near.get("can_attack_or_spell_when_dying", False)))
+			except Exception:
+				pass
+
+			# 玩法设计-属性：派生上限梯度
+			try:
+				if bool(flags.get("design_attribute", False)):
+					snap = getattr(self, "_applied_design_attribute_talent_gradients_snapshot", None)
+					if isinstance(snap, dict) and snap:
+						self._apply_design_attribute_talent_gradient_snapshot_to_vars(snap)
+			except Exception:
+				pass
+
+			# 玩法设计-法术：法术池配置
+			try:
+				if bool(flags.get("design_spell_pool", False)):
+					cfg = getattr(self, "_persistent_spell_pool_design_config", None)
+					use_test = True
+					try:
+						use_test = bool(cfg.get("use_test_spell_impl", True)) if isinstance(cfg, dict) else True
+					except Exception:
+						use_test = True
+					try:
+						self.design_spell_use_test_impl_var.set(bool(use_test))
+					except Exception:
+						pass
+
+					priorities = cfg.get("spell_priorities", {}) if isinstance(cfg, dict) else {}
+					if not isinstance(priorities, dict) or not priorities:
+						# 无已应用快照：清空，让下次打开时走默认初始化。
+						self.design_spell_priority_vars = {}
+					else:
+						# 复用/重建 StringVar，避免页面未打开时引用丢失。
+						out: dict[str, dict[str, tk.StringVar]] = {}
+						for prof, spell_map in priorities.items():
+							if not isinstance(spell_map, dict):
+								continue
+							out_prof: dict[str, tk.StringVar] = {}
+							for k, v in spell_map.items():
+								out_prof[str(k)] = tk.StringVar(value=str(v))
+							out[str(prof)] = out_prof
+						self.design_spell_priority_vars = out
+					# 清空缓存，保证回到“已应用”基线。
+					self._spell_priority_cache_when_test_impl_enabled = None
+			except Exception:
+				pass
+
+		# 清空 dirty 状态
+		try:
+			for section in list(flags.keys()):
+				self._set_system_settings_dirty(str(section), False)
+		except Exception:
+			pass
 
 	def _switch_system_settings_page(self, page_key: str) -> None:
 		"""切换系统设置窗口的一级页面（框架）。"""
@@ -4986,10 +6007,41 @@ class MainUI:
 		group.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 		group.columnconfigure(0, weight=1)
 
-		reserve = ttk.LabelFrame(boxes, text="预留", padding=10)
+		reserve = ttk.LabelFrame(boxes, text="投掷结果设置", padding=10)
 		reserve.grid(row=0, column=1, sticky="nsew")
 		reserve.columnconfigure(0, weight=1)
-		ttk.Label(reserve, text="（预留）后续综合设置项放这里", foreground="#6b7280").grid(row=0, column=0, sticky="nw")
+
+		reserve_intro = (
+			"用于测试：将特定的 d20 投掷强制为固定点数（1~20）。\n"
+			"仅测试端覆盖返回值，不改后端投掷算法。"
+		)
+		ttk.Label(reserve, text=reserve_intro, justify="left", foreground="#4b5563").grid(row=0, column=0, sticky="nw")
+
+		for idx, (key, label) in enumerate(self._D20_FORCE_OPTIONS, start=1):
+			row = ttk.Frame(reserve)
+			row.grid(row=idx, column=0, sticky="ew", pady=(8 if idx == 1 else 6, 0))
+			row.columnconfigure(0, weight=1)
+			ttk.Label(row, text=label).grid(row=0, column=0, sticky="w")
+			entry = ttk.Entry(row, textvariable=self.system_force_d20_value_vars[key], width=4, state="disabled")
+			entry.grid(row=0, column=1, padx=(8, 6), sticky="e")
+			cb = ttk.Checkbutton(row, variable=self.system_force_d20_vars[key])
+			cb.grid(row=0, column=2, sticky="e")
+
+			def _sync_entry_state(*_args: Any, _k: str = key, _e: ttk.Entry = entry) -> None:
+				try:
+					enabled = bool(self.system_force_d20_vars[_k].get())
+				except Exception:
+					enabled = False
+				try:
+					_e.configure(state="normal" if enabled else "disabled")
+				except Exception:
+					pass
+
+			try:
+				self.system_force_d20_vars[key].trace_add("write", _sync_entry_state)
+			except Exception:
+				pass
+			_sync_entry_state()
 
 		header = ttk.Frame(group)
 		header.grid(row=0, column=0, sticky="ew")
@@ -5033,9 +6085,43 @@ class MainUI:
 		status_var = tk.StringVar(value="")
 		status_label = ttk.Label(btn_row, textvariable=status_var, foreground="#6b7280")
 		status_label.grid(row=0, column=0, sticky="w")
+		dirty_var = tk.StringVar(value="")
+		try:
+			self._system_settings_dirty_label_vars["general"] = dirty_var
+			dirty_var.set("（未应用）" if bool(self._system_settings_dirty_flags.get("general", False)) else "")
+		except Exception:
+			pass
+		ttk.Label(btn_row, textvariable=dirty_var, foreground="#b45309").grid(row=0, column=1, sticky="e", padx=(0, 8))
 
 		apply_btn = ttk.Button(btn_row, text="应用", command=lambda: self._apply_system_general_settings(apply_btn, status_var))
-		apply_btn.grid(row=0, column=1, sticky="e")
+		apply_btn.grid(row=0, column=2, sticky="e")
+
+		def _mark_dirty(*_args: Any) -> None:
+			self._set_system_settings_dirty("general", True)
+
+		# 仅绑定一次，避免每次切换页面重复 trace 导致回调叠加。
+		if "general" not in self._system_settings_dirty_trace_bound_sections:
+			for var in self.right_info_category_visibility_vars.values():
+				try:
+					var.trace_add("write", _mark_dirty)
+				except Exception:
+					pass
+			for var in self.right_info_category_color_vars.values():
+				try:
+					var.trace_add("write", _mark_dirty)
+				except Exception:
+					pass
+			for var in self.system_force_d20_vars.values():
+				try:
+					var.trace_add("write", _mark_dirty)
+				except Exception:
+					pass
+			for var in self.system_force_d20_value_vars.values():
+				try:
+					var.trace_add("write", _mark_dirty)
+				except Exception:
+					pass
+			self._system_settings_dirty_trace_bound_sections.add("general")
 
 	def _apply_system_general_settings(self, apply_btn: ttk.Button, status_var: tk.StringVar) -> None:
 		"""应用综合设置：目前仅落地右侧信息展示区类别开关。"""
@@ -5057,10 +6143,52 @@ class MainUI:
 			if getattr(self, "right_info_panel", None) is not None:
 				self.right_info_panel.set_category_visibility(visibility)
 				self.right_info_panel.set_category_colors(colors)
-			status_var.set("已应用：右侧信息展示区类别显示/颜色")
+
+			# 投掷结果设置：写入当前 env，并安装测试端覆盖 hook。
+			force_flags = {key: bool(var.get()) for key, var in self.system_force_d20_vars.items()}
+			force_values: dict[str, int] = {}
+			for key, enabled in force_flags.items():
+				if not enabled:
+					continue
+				raw = str(self.system_force_d20_value_vars.get(key).get()).strip() if key in self.system_force_d20_value_vars else ""
+				try:
+					val = int(raw)
+				except Exception:
+					val = -1
+				if val < 1 or val > 20:
+					status_var.set("非法：投掷点数必须是 1~20 的整数")
+					self.root.after(1800, lambda: status_var.set(""))
+					return
+				force_values[key] = val
+
+			self.system_force_d20_flags = dict(force_flags)
+			self.system_force_d20_values = dict({k: int(v) for k, v in force_values.items()})
+			env = getattr(self.controller, "environment", None)
+			if env is not None:
+				try:
+					setattr(env, "_ui_force_d20_flags", dict(force_flags))
+					setattr(env, "_ui_force_d20_values", dict(force_values))
+					ensure_d20_force_installed(env, logger=lambda msg: self.right_info_panel.append_content(f"\n{msg}"))
+				except Exception:
+					try:
+						ensure_d20_force_installed(env)
+					except Exception:
+						pass
+
+			status_var.set("已应用：右侧信息展示区 + 投掷结果设置")
 			self.root.after(1500, lambda: status_var.set(""))
+			# 更新“已应用快照”，用于关闭时回滚。
 			try:
-				self.right_info_panel.append_content("\n[UI] 已应用综合设置：右侧信息展示区类别显示/颜色")
+				self._applied_system_general_settings_snapshot = self._collect_system_general_settings_snapshot_from_vars()
+			except Exception:
+				pass
+			self._set_system_settings_dirty("general", False)
+			try:
+				enabled_keys = [k for k, v in force_flags.items() if v]
+				enabled_text = "、".join(f"{k}={force_values.get(k, 20)}" for k in enabled_keys) if enabled_keys else "无"
+				self.right_info_panel.append_content(
+					f"\n[UI] 已应用综合设置：右侧信息展示区类别显示/颜色；投掷结果设置={enabled_text}"
+				)
 			except Exception:
 				pass
 		finally:
@@ -5074,8 +6202,7 @@ class MainUI:
 
 		intro = (
 			"这里将用于设计全局玩法规则/行动规则，并支持扩展新的行动、职业、法术等。\n"
-			"当前先搭建页内多区域切换框架（类似行动设置中的攻击/法术切换）。\n\n"
-			"实现策略倾向：不改后端文件，通过测试端运行时注入（monkeypatch）让本局生效。"
+			"实现方式：不改后端文件，通过测试端覆盖实现。"
 		)
 		ttk.Label(wrapper, text="玩法设计", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
 		ttk.Label(wrapper, text=intro, justify="left", foreground="#4b5563").grid(row=1, column=0, sticky="nw")
@@ -5098,17 +6225,35 @@ class MainUI:
 		nb.add(tab_attr, text="属性")
 
 		# 其余占位
-		for title in ("法术", "攻击", "职业"):
-			tab = ttk.Frame(nb, padding=10)
-			tab.columnconfigure(0, weight=1)
-			tab.rowconfigure(0, weight=1)
-			ttk.Label(tab, text=f"（占位）{title}相关全局设置区域", justify="left", foreground="#6b7280").grid(
-				row=0, column=0, sticky="nw"
-			)
-			nb.add(tab, text=title)
+		# 法术
+		tab_spell = ttk.Frame(nb, padding=10)
+		tab_spell.columnconfigure(0, weight=1)
+		tab_spell.rowconfigure(0, weight=1)
+		self._build_design_spell_pool_page(tab_spell)
+		nb.add(tab_spell, text="法术")
+
+		# 攻击（占位）
+		tab_attack = ttk.Frame(nb, padding=10)
+		tab_attack.columnconfigure(0, weight=1)
+		tab_attack.rowconfigure(0, weight=1)
+		ttk.Label(tab_attack, text="（占位）攻击相关全局设置区域", justify="left", foreground="#6b7280").grid(
+			row=0, column=0, sticky="nw"
+		)
+		nb.add(tab_attack, text="攻击")
+
+		# 职业（占位）
+		tab_prof = ttk.Frame(nb, padding=10)
+		tab_prof.columnconfigure(0, weight=1)
+		tab_prof.rowconfigure(0, weight=1)
+		ttk.Label(tab_prof, text="（占位）职业相关全局设置区域", justify="left", foreground="#6b7280").grid(
+			row=0, column=0, sticky="nw"
+		)
+		nb.add(tab_prof, text="职业")
 
 	def _build_design_attribute_page(self, parent: ttk.Frame) -> None:
 		"""玩法设计 -> 属性页面：属性派生上限梯度（最大行动位/最大法术位）。"""
+		# 部分控件会在创建后的 idle 阶段写回 Variable；抑制该阶段的“写入即脏”。
+		self._suppress_system_settings_dirty_until_idle()
 		# 该页内容可能较高（梯度数=7 时），因此只对“属性页”做有限高度滚动。
 		parent.columnconfigure(0, weight=1)
 		parent.rowconfigure(0, weight=1)
@@ -5262,10 +6407,28 @@ class MainUI:
 		if self.design_attribute_status_var is None:
 			self.design_attribute_status_var = tk.StringVar(value="")
 		ttk.Label(btn_row, textvariable=self.design_attribute_status_var, foreground="#6b7280").grid(row=0, column=0, sticky="w")
+		dirty_var = tk.StringVar(value="")
+		try:
+			self._system_settings_dirty_label_vars["design_attribute"] = dirty_var
+			dirty_var.set("（未应用）" if bool(self._system_settings_dirty_flags.get("design_attribute", False)) else "")
+		except Exception:
+			pass
+		ttk.Label(btn_row, textvariable=dirty_var, foreground="#b45309").grid(row=0, column=1, sticky="e", padx=(0, 8))
 		apply_btn = ttk.Button(btn_row, text="应用", command=lambda: self._apply_design_attribute_talent_gradients(apply_btn))
-		apply_btn.grid(row=0, column=1, sticky="e")
+		apply_btn.grid(row=0, column=2, sticky="e")
 		reset_btn = ttk.Button(btn_row, text="恢复默认", command=lambda: self._reset_design_attribute_talent_gradients(reset_btn))
-		reset_btn.grid(row=0, column=2, sticky="e", padx=(8, 0))
+		reset_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+		def _mark_dirty(*_args: Any) -> None:
+			self._set_system_settings_dirty("design_attribute", True)
+
+		if "design_attribute" not in self._system_settings_dirty_trace_bound_sections:
+			for var in self.design_talent_gradient_count_vars.values():
+				try:
+					var.trace_add("write", _mark_dirty)
+				except Exception:
+					pass
+			self._system_settings_dirty_trace_bound_sections.add("design_attribute")
 
 	def _ensure_one_talent_gradient_initialized(self, stat_key: str) -> None:
 		"""确保某个天赋梯度已初始化为合法默认值（首次进入/被格式化清空时兜底）。"""
@@ -5282,10 +6445,28 @@ class MainUI:
 			and all(str(v.get()).strip() != "" for v in old_val)
 			and (n == 1 or all(str(v.get()).strip() != "" for v in old_th))
 		)
-		if not complete:
-			self._reset_one_talent_gradient_to_default(stat_key)
+		with self._suppress_system_settings_dirty():
+			if not complete:
+				self._reset_one_talent_gradient_to_default(stat_key)
+				return
+			self._rebuild_talent_gradient_rows(stat_key, preserve_values=True)
+
+	def _apply_design_attribute_talent_gradient_snapshot_to_vars(self, snapshot: dict[str, Any]) -> None:
+		"""将已应用的派生上限梯度快照回填到 UI 变量（用于“丢弃未应用”回滚）。"""
+		if not isinstance(snapshot, dict):
 			return
-		self._rebuild_talent_gradient_rows(stat_key, preserve_values=True)
+		for stat_key in ("strength", "dexterity", "intelligence"):
+			stat = snapshot.get(stat_key)
+			if not isinstance(stat, dict):
+				continue
+			thresholds = stat.get("thresholds", [])
+			values = stat.get("values", [])
+			if not isinstance(thresholds, list) or not isinstance(values, list) or not values:
+				continue
+			self.design_talent_gradient_count_vars[stat_key].set(len(values))
+			self.design_talent_gradient_threshold_vars[stat_key] = [tk.StringVar(value=str(x)) for x in thresholds]
+			self.design_talent_gradient_value_vars[stat_key] = [tk.StringVar(value=str(x)) for x in values]
+			self._rebuild_talent_gradient_rows(stat_key, preserve_values=True)
 
 	def _clear_design_attribute_gradient_error_highlight(self) -> None:
 		for stat_key in ("strength", "dexterity", "intelligence"):
@@ -5350,6 +6531,10 @@ class MainUI:
 					v.set(str(old_th_vars[i].get()))
 				except Exception:
 					pass
+			try:
+				v.trace_add("write", lambda *_a: self._set_system_settings_dirty("design_attribute", True))
+			except Exception:
+				pass
 			new_th_vars.append(v)
 		for i in range(n):
 			v = tk.StringVar(value="")
@@ -5358,6 +6543,10 @@ class MainUI:
 					v.set(str(old_val_vars[i].get()))
 				except Exception:
 					pass
+			try:
+				v.trace_add("write", lambda *_a: self._set_system_settings_dirty("design_attribute", True))
+			except Exception:
+				pass
 			new_val_vars.append(v)
 
 		self.design_talent_gradient_threshold_vars[stat_key] = new_th_vars
@@ -5384,7 +6573,10 @@ class MainUI:
 
 	def _build_design_global_page(self, parent: ttk.Frame) -> None:
 		"""玩法设计 -> 全局页面：目前仅实现濒死系统（测试端独立玩法）。"""
+		# 部分控件会在创建后的 idle 阶段写回 Variable；抑制该阶段的“写入即脏”。
+		self._suppress_system_settings_dirty_until_idle()
 		parent.columnconfigure(0, weight=1)
+		# 滚动区占剩余空间；按钮行固定不随滚动。
 		parent.rowconfigure(1, weight=1)
 		parent.rowconfigure(2, weight=0)
 
@@ -5499,7 +6691,7 @@ class MainUI:
 
 		note = (
 			"设计来源：warchess_plan (1).md（后端当前未实现，故仅在测试端启用）。\n"
-			"当棋子生命降为 0 时触发死亡检定；结果可能进入【濒死】。濒死期间轮到其行动会被跳过。"
+			"当棋子生命降为 0 时触发死亡检定；结果可能进入【濒死】。"
 		)
 		note_label = ttk.Label(box, text=note, justify="left", foreground="#4b5563")
 		note_label.grid(row=0, column=0, sticky="w")
@@ -5508,7 +6700,7 @@ class MainUI:
 		enable_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
 		# 避免把 Entry 所在列拉伸导致“【空】HP”间隔过大：把弹性空间放到最后一列。
 		enable_row.columnconfigure(4, weight=1)
-		ttk.Checkbutton(enable_row, text="启用濒死系统（默认关闭）", variable=self.design_near_death_enabled_var).grid(
+		ttk.Checkbutton(enable_row, text="启用濒死系统（默认开启）", variable=self.design_near_death_enabled_var).grid(
 			row=0, column=0, sticky="w"
 		)
 		ttk.Label(enable_row, text="死亡检定 d20=20 恢复至").grid(row=0, column=1, sticky="w", padx=(14, 0))
@@ -5519,17 +6711,69 @@ class MainUI:
 
 		param_row = ttk.Frame(box)
 		param_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-		ttk.Label(param_row, text="濒死后，在被跳过").grid(row=0, column=0, sticky="w")
+		ttk.Label(param_row, text="濒死后，在经过").grid(row=0, column=0, sticky="w")
 		turn_spin = tk.Spinbox(param_row, from_=1, to=3, width=3, textvariable=self.design_near_death_turns_to_die_var)
 		turn_spin.grid(row=0, column=1, sticky="w", padx=(6, 6))
-		ttk.Label(param_row, text="次行动后直接死亡").grid(row=0, column=2, sticky="w")
+		turn_hint_var = tk.StringVar(value="轮（即0回合）后直接死亡")
+		ttk.Label(param_row, textvariable=turn_hint_var).grid(row=0, column=2, sticky="w")
 		ttk.Checkbutton(param_row, text="濒死期间再次受伤直接死亡", variable=self.design_near_death_die_on_damage_var).grid(
 			row=0, column=3, sticky="w", padx=(14, 0)
 		)
 
+		cap_row = ttk.Frame(box)
+		cap_row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+		# 文案口径："濒死状态下，棋子" + 勾选框(能/不能) + "移动，" + 勾选框(能/不能) + "攻击或法术。"
+		ttk.Label(cap_row, text="濒死状态下，棋子").grid(row=0, column=0, sticky="w")
+		move_text_var = tk.StringVar(value="能")
+		act_text_var = tk.StringVar(value="能")
+		move_ck = ttk.Checkbutton(cap_row, variable=self.design_near_death_can_move_var, textvariable=move_text_var)
+		move_ck.grid(row=0, column=1, sticky="w", padx=(4, 0))
+		ttk.Label(cap_row, text="移动，").grid(row=0, column=2, sticky="w")
+		act_ck = ttk.Checkbutton(cap_row, variable=self.design_near_death_can_attack_spell_var, textvariable=act_text_var)
+		act_ck.grid(row=0, column=3, sticky="w", padx=(4, 0))
+		ttk.Label(cap_row, text="攻击或法术。",).grid(row=0, column=4, sticky="w")
+
 		preview_var = tk.StringVar(value="")
 		preview = ttk.Label(box, textvariable=preview_var, justify="left", foreground="#374151")
-		preview.grid(row=3, column=0, sticky="w", pady=(10, 0))
+		preview.grid(row=4, column=0, sticky="w", pady=(10, 0))
+
+		def _runtime_alive_piece_count() -> int:
+			"""用于 UI 展示的“回合数”估算：按当前场上 is_alive=True 的棋子数计。"""
+			try:
+				if self.controller.runtime_source != "runtime_env":
+					return 0
+				env = getattr(self.controller, "environment", None)
+				if env is None:
+					return 0
+				total = 0
+				for player_attr in ("player1", "player2"):
+					player = getattr(env, player_attr, None)
+					pieces = self._coerce_piece_list(getattr(player, "pieces", None) if player is not None else None)
+					for p in pieces:
+						try:
+							if bool(getattr(p, "is_alive", True)):
+								total += 1
+						except Exception:
+							continue
+				return max(0, int(total))
+			except Exception:
+				return 0
+
+		def _refresh_capability_texts(*_args: Any) -> None:
+			move_text_var.set("能" if bool(self.design_near_death_can_move_var.get()) else "不能")
+			act_text_var.set("能" if bool(self.design_near_death_can_attack_spell_var.get()) else "不能")
+
+		def _refresh_turn_hint(*_args: Any) -> None:
+			try:
+				rounds = int(self.design_near_death_turns_to_die_var.get())
+			except Exception:
+				rounds = 1
+			rounds = max(1, min(3, rounds))
+			alive_cnt = _runtime_alive_piece_count()
+			if alive_cnt <= 0:
+				turn_hint_var.set("轮（即?回合）后直接死亡")
+				return
+			turn_hint_var.set(f"轮（即{alive_cnt * rounds}回合）后直接死亡")
 
 		def _refresh_preview(*_args: Any) -> None:
 			enabled = bool(self.design_near_death_enabled_var.get())
@@ -5540,14 +6784,23 @@ class MainUI:
 				turns = 1
 			turns = max(1, min(3, turns))
 			die_on_damage = bool(self.design_near_death_die_on_damage_var.get())
+			alive_cnt = _runtime_alive_piece_count()
+			total_turns = int(alive_cnt * turns) if alive_cnt > 0 else 0
+			can_move = bool(self.design_near_death_can_move_var.get())
+			can_act = bool(self.design_near_death_can_attack_spell_var.get())
 			preview_var.set(
 				"\n".join(
 					[
 						f"当前：{'开启' if enabled else '关闭'}",
 						"死亡检定：HP→0 时掷 d20；20 恢复；1 直接死亡；其他进入濒死",
 						f"d20=20：恢复至 {revive_hp} HP",
-						f"濒死：轮到该棋子时跳过行动；累计跳过 {turns} 次后死亡",
+						(
+							f"濒死：经过 {turns} 轮（约 {total_turns} 回合）后死亡"
+							if alive_cnt > 0
+							else f"濒死：经过 {turns} 轮后死亡（未加载 runtime env，无法估算回合数）"
+						),
 						f"濒死期间再次受伤：{'直接死亡' if die_on_damage else '按死亡检定处理'}",
+						f"濒死行动能力：移动={'能' if can_move else '不能'}；攻击/法术={'能' if can_act else '不能'}",
 						"被治疗至 >0：解除濒死",
 					]
 				)
@@ -5558,11 +6811,24 @@ class MainUI:
 			self.design_near_death_revive_hp_var,
 			self.design_near_death_turns_to_die_var,
 			self.design_near_death_die_on_damage_var,
+			self.design_near_death_can_move_var,
+			self.design_near_death_can_attack_spell_var,
 		):
 			try:
 				var.trace_add("write", _refresh_preview)
 			except Exception:
 				pass
+		try:
+			self.design_near_death_can_move_var.trace_add("write", _refresh_capability_texts)
+			self.design_near_death_can_attack_spell_var.trace_add("write", _refresh_capability_texts)
+		except Exception:
+			pass
+		try:
+			self.design_near_death_turns_to_die_var.trace_add("write", _refresh_turn_hint)
+		except Exception:
+			pass
+		_refresh_capability_texts()
+		_refresh_turn_hint()
 		_refresh_preview()
 
 		# 固定按钮行：不随滚动移动
@@ -5574,11 +6840,55 @@ class MainUI:
 		ttk.Label(btn_row, textvariable=self.design_global_status_var, foreground="#6b7280").grid(
 			row=0, column=0, sticky="w"
 		)
+		dirty_var = tk.StringVar(value="")
+		try:
+			self._system_settings_dirty_label_vars["design_global_near_death"] = dirty_var
+			dirty_var.set("（未应用）" if bool(self._system_settings_dirty_flags.get("design_global_near_death", False)) else "")
+		except Exception:
+			pass
+		ttk.Label(btn_row, textvariable=dirty_var, foreground="#b45309").grid(row=0, column=1, sticky="e", padx=(0, 8))
 		apply_btn = ttk.Button(btn_row, text="应用", command=lambda: self._apply_design_global_near_death_settings(apply_btn))
-		apply_btn.grid(row=0, column=1, sticky="e")
+		apply_btn.grid(row=0, column=2, sticky="e")
+
+		def _reset_to_default() -> None:
+			# 恢复为 UI 侧默认：默认开启；濒死期间默认不能移动/不能攻击或法术。
+			try:
+				self.design_near_death_enabled_var.set(True)
+				self.design_near_death_revive_hp_var.set("1")
+				self.design_near_death_turns_to_die_var.set(1)
+				self.design_near_death_die_on_damage_var.set(True)
+				self.design_near_death_can_move_var.set(False)
+				self.design_near_death_can_attack_spell_var.set(False)
+			except Exception:
+				pass
+			self._set_system_settings_dirty("design_global_near_death", True)
+			if self.design_global_status_var is not None:
+				self.design_global_status_var.set("已恢复默认（未应用）")
+				self.root.after(1800, lambda: self.design_global_status_var.set(""))
+
+		reset_btn = ttk.Button(btn_row, text="恢复默认", command=_reset_to_default)
+		reset_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+		def _mark_dirty(*_args: Any) -> None:
+			self._set_system_settings_dirty("design_global_near_death", True)
+
+		if "design_global_near_death" not in self._system_settings_dirty_trace_bound_sections:
+			for var in (
+				self.design_near_death_enabled_var,
+				self.design_near_death_revive_hp_var,
+				self.design_near_death_turns_to_die_var,
+				self.design_near_death_die_on_damage_var,
+				self.design_near_death_can_move_var,
+				self.design_near_death_can_attack_spell_var,
+			):
+				try:
+					var.trace_add("write", _mark_dirty)
+				except Exception:
+					pass
+			self._system_settings_dirty_trace_bound_sections.add("design_global_near_death")
 
 	def _apply_design_global_near_death_settings(self, btn: ttk.Button) -> None:
-		"""应用玩法设计->全局：濒死系统配置（仅本局运行时 env 生效）。"""
+		"""应用玩法设计->全局：濒死系统配置（跨局保持，直到手动关闭/再次应用）。"""
 		try:
 			btn.configure(state="disabled")
 			enabled = bool(self.design_near_death_enabled_var.get())
@@ -5594,6 +6904,8 @@ class MainUI:
 				turns_to_die = 1
 			turns_to_die = max(1, min(3, turns_to_die))
 			die_on_damage = bool(self.design_near_death_die_on_damage_var.get())
+			can_move = bool(self.design_near_death_can_move_var.get())
+			can_act = bool(self.design_near_death_can_attack_spell_var.get())
 
 			config = {
 				"near_death": {
@@ -5601,23 +6913,523 @@ class MainUI:
 					"revive_hp_on_20": int(revive_hp),
 					"turns_to_die": int(turns_to_die),
 					"die_on_damage_when_dying": bool(die_on_damage),
+					"can_move_when_dying": bool(can_move),
+					"can_attack_or_spell_when_dying": bool(can_act),
 				}
 			}
-			ok = self._apply_near_death_config_to_runtime_environment(config)
-			if not ok:
-				if self.design_global_status_var is not None:
-					self.design_global_status_var.set("未生效：当前未加载 runtime env")
-					self.root.after(1800, lambda: self.design_global_status_var.set(""))
-				return
-			if self.design_global_status_var is not None:
-				self.design_global_status_var.set("应用成功：濒死系统已注入（本局生效）")
-				self.root.after(1800, lambda: self.design_global_status_var.set(""))
+			# 跨局保持：无论当前是否已加载 runtime env，都先保存到 UI 持久快照。
 			try:
-				self.right_info_panel.append_content("\n[UI] 玩法设计-全局：濒死系统配置已应用（本局临时生效）")
+				self._persistent_near_death_design_config = copy.deepcopy(config)
+			except Exception:
+				self._persistent_near_death_design_config = dict(config)
+
+			ok = self._apply_near_death_config_to_runtime_environment(config)
+			if self.design_global_status_var is not None:
+				if ok:
+					self.design_global_status_var.set("应用成功：濒死系统已注入（跨局保持）")
+				else:
+					self.design_global_status_var.set("已保存：将在后续加载 runtime env 时自动生效")
+				self.root.after(1800, lambda: self.design_global_status_var.set(""))
+			self._set_system_settings_dirty("design_global_near_death", False)
+			try:
+				if ok:
+					self.right_info_panel.append_content("\n[UI] 玩法设计-全局：濒死系统配置已应用（跨局保持）")
+				else:
+					self.right_info_panel.append_content("\n[UI] 玩法设计-全局：濒死系统配置已保存（将对后续对局生效）")
 			except Exception:
 				pass
 		finally:
 			btn.configure(state="normal")
+
+	def _build_design_spell_pool_page(self, parent: ttk.Frame) -> None:
+		"""玩法设计 -> 法术：法术池配置（职业×法术优先级）。"""
+		# 部分控件会在创建后的 idle 阶段写回 Variable；抑制该阶段的“写入即脏”。
+		self._suppress_system_settings_dirty_until_idle()
+		parent.columnconfigure(0, weight=1)
+		# header 固定；滚动区占剩余空间；按钮行固定。
+		parent.rowconfigure(0, weight=0)
+		parent.rowconfigure(1, weight=1)
+		parent.rowconfigure(2, weight=0)
+
+		header = ttk.Frame(parent)
+		header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+		header.columnconfigure(0, weight=1)
+		ttk.Label(header, text="法术池配置", font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+		ttk.Checkbutton(
+			header,
+			text="启用测试端法术默认实现（实时生效）",
+			variable=self.design_spell_use_test_impl_var,
+		).grid(row=0, column=1, sticky="e")
+
+		# 内容可能随未来法术扩展而变高：使用自适应高度滚动容器。
+		scroll_host = ttk.Frame(parent)
+		scroll_host.grid(row=1, column=0, sticky="nsew")
+		scroll_host.columnconfigure(0, weight=1)
+		scroll_host.rowconfigure(0, weight=1)
+
+		canvas = tk.Canvas(scroll_host, highlightthickness=0, borderwidth=0)
+		v_scroll = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview)
+		canvas.configure(yscrollcommand=v_scroll.set)
+		canvas.grid(row=0, column=0, sticky="nsew")
+		v_scroll.grid(row=0, column=1, sticky="ns")
+
+		body = ttk.Frame(canvas)
+		canvas_window = canvas.create_window((0, 0), window=body, anchor="nw")
+		body.columnconfigure(0, weight=1)
+
+		note_var = tk.StringVar(value="")
+		note_label = ttk.Label(body, textvariable=note_var, justify="left", foreground="#4b5563")
+		note_label.grid(row=0, column=0, sticky="nw")
+
+		def _sync_scroll_region(_event: Any = None) -> None:
+			try:
+				body.update_idletasks()
+				req_w = int(body.winfo_reqwidth())
+				req_h = int(body.winfo_reqheight())
+				canvas.configure(scrollregion=(0, 0, max(req_w, 1), max(req_h, 1)))
+				# 自适应高度：内容少时贴合；内容多时给上限并允许滚动。
+				desired = min(max(req_h + 8, 180), 520)
+				canvas.configure(height=int(desired))
+			except Exception:
+				canvas.configure(scrollregion=canvas.bbox("all"))
+
+		def _fit_body_width(event: Any) -> None:
+			try:
+				w = int(event.width)
+			except Exception:
+				w = 0
+			try:
+				canvas.itemconfigure(canvas_window, width=max(w, 1))
+			except Exception:
+				pass
+			wrap = max(240, w - 40)
+			try:
+				note_label.configure(wraplength=wrap)
+			except Exception:
+				pass
+
+		def _on_mousewheel(event: Any) -> None:
+			try:
+				sr = str(canvas.cget("scrollregion") or "").strip()
+				parts = [float(x) for x in sr.split()] if sr else []
+				content_h = float(parts[3] - parts[1]) if len(parts) == 4 else 0.0
+				view_h = float(canvas.winfo_height())
+				if content_h <= view_h + 2:
+					return
+			except Exception:
+				pass
+			try:
+				delta = int(getattr(event, "delta", 0))
+				if delta == 0:
+					return
+			except Exception:
+				return
+			try:
+				canvas.yview_scroll(-int(delta / 120), "units")
+				first, last = canvas.yview()
+				if first < 0:
+					canvas.yview_moveto(0)
+				elif last > 1:
+					span = max(1e-9, last - first)
+					canvas.yview_moveto(max(0.0, 1.0 - span))
+			except Exception:
+				return
+
+		def _bind_wheel_global() -> None:
+			if self._design_spell_mousewheel_bind_id is None:
+				try:
+					self._design_spell_mousewheel_bind_id = self.root.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+				except Exception:
+					self._design_spell_mousewheel_bind_id = None
+
+		def _unbind_wheel_global() -> None:
+			if self._design_spell_mousewheel_bind_id is not None:
+				try:
+					self.root.unbind_all("<MouseWheel>", self._design_spell_mousewheel_bind_id)
+				except Exception:
+					pass
+				self._design_spell_mousewheel_bind_id = None
+
+		body.bind("<Configure>", _sync_scroll_region)
+		canvas.bind("<Configure>", _fit_body_width)
+		scroll_host.bind("<Enter>", lambda _e: _bind_wheel_global())
+		scroll_host.bind("<Leave>", lambda _e: _unbind_wheel_global())
+
+		def _normalize_spell_key(name: str) -> str:
+			key = str(name or "").strip().lower()
+			key = key.replace(" ", "")
+			if key in ("arrowhit", "arrow_hit"):
+				return "arrow_hit"
+			if key == "fireball":
+				return "fireball"
+			if key == "trap":
+				return "trap"
+			if key == "heal":
+				return "heal"
+			if key in ("teleport", "move"):
+				return "teleport"
+			return key
+
+		# 纵轴法术顺序按产品定义固定（从上到下）：
+		# 箭击、陷阱、治愈、瞬移、火球。
+		# 未来若加入新法术：在此处追加到 SPELL_ROWS（暂不在 UI 中显示，先保留代码注释入口）。
+		SPELL_ROWS: list[tuple[str, str]] = [
+			("arrow_hit", "箭击"),
+			("trap", "陷阱"),
+			("heal", "治愈"),
+			("teleport", "瞬移"),
+			("fireball", "火球"),
+		]
+		# 横轴职业：战士拆分长/短。
+		PROF_COLS: list[tuple[str, str]] = [
+			("WarriorLong", "战士(长)"),
+			("WarriorShort", "战士(短)"),
+			("Archer", "弓箭手"),
+			("Mage", "法师"),
+		]
+
+		def _get_test_default_priority_map() -> dict[str, dict[str, int]]:
+			base: dict[str, dict[str, int]] = {k: {sk: 0 for sk, _t in SPELL_ROWS} for k, _t2 in PROF_COLS}
+			# 数字越小优先级越高：越先进入法术池。
+			base["WarriorLong"]["arrow_hit"] = 1
+			base["WarriorLong"]["heal"] = 2
+			base["WarriorShort"]["trap"] = 1
+			base["WarriorShort"]["heal"] = 2
+			base["Archer"]["arrow_hit"] = 1
+			base["Archer"]["trap"] = 2
+			base["Mage"]["arrow_hit"] = 1
+			base["Mage"]["trap"] = 2
+			base["Mage"]["heal"] = 3
+			base["Mage"]["teleport"] = 4
+			base["Mage"]["fireball"] = 5
+			return base
+
+		def _get_backend_default_priority_map() -> dict[str, dict[str, int]]:
+			base: dict[str, dict[str, int]] = {k: {sk: 0 for sk, _t in SPELL_ROWS} for k, _t2 in PROF_COLS}
+			# 后端实现目前不区分战士长/短：两者都用 Warrior 的默认池展示。
+			prof_type_map = {
+				"WarriorLong": "Warrior",
+				"WarriorShort": "Warrior",
+				"Archer": "Archer",
+				"Mage": "Mage",
+			}
+			for prof_key, piece_type in prof_type_map.items():
+				selected: list[str] = []
+				try:
+					dummy = SimpleNamespace(type=piece_type, intelligence=999)
+					for sp in SpellFactory.get_available_spells(dummy):
+						selected.append(_normalize_spell_key(str(getattr(sp, "name", ""))))
+				except Exception:
+					selected = []
+				# 展示用优先级：按固定纵轴顺序从 1 开始依次编号。
+				chosen = {k for k in selected if k}
+				pri = 1
+				for sk, _t in SPELL_ROWS:
+					if sk in chosen:
+						base[prof_key][sk] = pri
+						pri += 1
+					else:
+						base[prof_key][sk] = 0
+			return base
+
+		def _ensure_priority_vars_structure() -> None:
+			if not isinstance(getattr(self, "design_spell_priority_vars", None), dict):
+				self.design_spell_priority_vars = {}
+			for prof_key, _pt in PROF_COLS:
+				row = self.design_spell_priority_vars.setdefault(prof_key, {})
+				if not isinstance(row, dict):
+					self.design_spell_priority_vars[prof_key] = {}
+					row = self.design_spell_priority_vars[prof_key]
+				for spell_key, _st in SPELL_ROWS:
+					if spell_key not in row or not isinstance(row.get(spell_key), tk.StringVar):
+						row[spell_key] = tk.StringVar(value="0")
+
+		def _set_priority_vars_from_map(m: dict[str, dict[str, int]]) -> None:
+			with self._suppress_system_settings_dirty():
+				for prof_key, _pt in PROF_COLS:
+					row_vars = self.design_spell_priority_vars.setdefault(prof_key, {})
+					for spell_key, _st in SPELL_ROWS:
+						val = 0
+						try:
+							val = int(m.get(prof_key, {}).get(spell_key, 0))
+						except Exception:
+							val = 0
+						try:
+							row_vars[spell_key].set(str(val))
+						except Exception:
+							pass
+
+		def _collect_priority_cache_from_vars() -> dict[str, dict[str, str]]:
+			out: dict[str, dict[str, str]] = {}
+			for prof_key, _pt in PROF_COLS:
+				row_out: dict[str, str] = {}
+				row_vars = self.design_spell_priority_vars.get(prof_key, {})
+				for spell_key, _st in SPELL_ROWS:
+					try:
+						row_out[spell_key] = str(row_vars.get(spell_key).get()).strip()
+					except Exception:
+						row_out[spell_key] = "0"
+				out[prof_key] = row_out
+			return out
+
+		def _restore_priority_vars_from_cache(cache: dict[str, dict[str, str]] | None) -> None:
+			if not isinstance(cache, dict):
+				return
+			with self._suppress_system_settings_dirty():
+				for prof_key, _pt in PROF_COLS:
+					row_vars = self.design_spell_priority_vars.setdefault(prof_key, {})
+					cached_row = cache.get(prof_key, {}) if isinstance(cache.get(prof_key, {}), dict) else {}
+					for spell_key, _st in SPELL_ROWS:
+						val = str(cached_row.get(spell_key, "0")).strip()
+						try:
+							row_vars[spell_key].set(val)
+						except Exception:
+							pass
+
+		# 应用“持久配置”的 use_test 标志（该标志是实时生效的，不绑定应用按钮）。
+		cfg = getattr(self, "_persistent_spell_pool_design_config", None)
+		if isinstance(cfg, dict) and "use_test_spell_impl" in cfg:
+			try:
+				self.design_spell_use_test_impl_var.set(bool(cfg.get("use_test_spell_impl", True)))
+			except Exception:
+				pass
+
+		_ensure_priority_vars_structure()
+		# 初始化：优先从持久配置恢复（上次“应用”的测试端优先级）；否则走测试端默认。
+		if not self.design_spell_priority_vars or all(not v for v in self.design_spell_priority_vars.values()):
+			self.design_spell_priority_vars = {}
+			_ensure_priority_vars_structure()
+		try:
+			stored = cfg.get("spell_priorities", None) if isinstance(cfg, dict) else None
+		except Exception:
+			stored = None
+		if isinstance(stored, dict) and stored:
+			# 仅按已存 key 写入，其余补 0。
+			with self._suppress_system_settings_dirty():
+				for prof_key, _pt in PROF_COLS:
+					row_vars = self.design_spell_priority_vars.setdefault(prof_key, {})
+					mrow = stored.get(prof_key, {}) if isinstance(stored.get(prof_key, {}), dict) else {}
+					for spell_key, _st in SPELL_ROWS:
+						val = str(mrow.get(spell_key, "0")).strip()
+						try:
+							row_vars[spell_key].set(val)
+						except Exception:
+							pass
+		else:
+			_set_priority_vars_from_map(_get_test_default_priority_map())
+
+		# 初始化测试端缓存：用于在“走后端实现”与“测试端实现”之间来回切换。
+		if self._spell_priority_cache_when_test_impl_enabled is None:
+			self._spell_priority_cache_when_test_impl_enabled = _collect_priority_cache_from_vars()
+
+		# 依据当前模式决定表格显示内容。
+		if not bool(self.design_spell_use_test_impl_var.get()):
+			# 走后端实现：展示后端默认配置（组件禁用）
+			_set_priority_vars_from_map(_get_backend_default_priority_map())
+		else:
+			# 测试端实现：展示缓存的优先级表
+			_restore_priority_vars_from_cache(self._spell_priority_cache_when_test_impl_enabled)
+
+		table = ttk.LabelFrame(body, text="法术池配置（优先级 0 / 1~5，数字越小越优先）", padding=10)
+		table.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+		table.columnconfigure(0, weight=0)
+		for cidx in range(1, len(PROF_COLS) + 1):
+			table.columnconfigure(cidx, weight=1)
+
+		ttk.Label(table, text="法术", width=10).grid(row=0, column=0, sticky="w")
+		for cidx, (_prof_key, title) in enumerate(PROF_COLS, start=1):
+			ttk.Label(table, text=title, width=10).grid(row=0, column=cidx, sticky="w")
+
+		def _mark_dirty(*_args: Any) -> None:
+			self._set_system_settings_dirty("design_spell_pool", True)
+
+		entries: list[ttk.Entry] = []
+		for ridx, (spell_key, spell_title) in enumerate(SPELL_ROWS, start=1):
+			ttk.Label(table, text=spell_title, width=10).grid(row=ridx, column=0, sticky="w")
+			for cidx, (prof_key, _prof_title) in enumerate(PROF_COLS, start=1):
+				row_vars = self.design_spell_priority_vars.setdefault(prof_key, {})
+				var = row_vars.get(spell_key)
+				if var is None or not isinstance(var, tk.StringVar):
+					var = tk.StringVar(value="0")
+					row_vars[spell_key] = var
+				entry = ttk.Entry(table, textvariable=var, width=4)
+				entry.grid(row=ridx, column=cidx, sticky="w")
+				entries.append(entry)
+				try:
+					entry.bind("<KeyRelease>", lambda _e, _md=_mark_dirty: _md())
+					entry.bind("<FocusOut>", lambda _e, _md=_mark_dirty: _md())
+				except Exception:
+					pass
+				try:
+					var.trace_add("write", _mark_dirty)
+				except Exception:
+					pass
+
+		# 固定按钮行：不随滚动移动
+		btn_row = ttk.Frame(parent)
+		btn_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+		btn_row.columnconfigure(0, weight=1)
+		status_var = tk.StringVar(value="")
+		ttk.Label(btn_row, textvariable=status_var, foreground="#6b7280").grid(row=0, column=0, sticky="w")
+		dirty_var = tk.StringVar(value="")
+		try:
+			self._system_settings_dirty_label_vars["design_spell_pool"] = dirty_var
+			dirty_var.set("（未应用）" if bool(self._system_settings_dirty_flags.get("design_spell_pool", False)) else "")
+		except Exception:
+			pass
+		ttk.Label(btn_row, textvariable=dirty_var, foreground="#b45309").grid(row=0, column=1, sticky="e", padx=(0, 8))
+
+		def _parse_priorities_from_vars() -> dict[str, dict[str, int]] | None:
+			out: dict[str, dict[str, int]] = {}
+			for prof_key, _pt in PROF_COLS:
+				row_out: dict[str, int] = {}
+				row_vars = self.design_spell_priority_vars.get(prof_key, {})
+				for spell_key, _st in SPELL_ROWS:
+					raw = ""
+					try:
+						raw = str(row_vars.get(spell_key).get()).strip()
+					except Exception:
+						raw = ""
+					if raw == "":
+						val = 0
+					else:
+						try:
+							val = int(raw)
+						except Exception:
+							status_var.set("非法：优先级只能填写 0 或 1~5（数字越小越优先）")
+							self.root.after(1800, lambda: status_var.set(""))
+							return None
+					if val < 0 or val > 5:
+						status_var.set("非法：优先级范围为 0 或 1~5")
+						self.root.after(1800, lambda: status_var.set(""))
+						return None
+					row_out[spell_key] = int(val)
+				out[prof_key] = row_out
+			return out
+
+		def _apply() -> None:
+			if not bool(self.design_spell_use_test_impl_var.get()):
+				status_var.set("当前走后端实现：无法应用测试端配置")
+				self.root.after(1800, lambda: status_var.set(""))
+				return
+			priorities = _parse_priorities_from_vars()
+			if priorities is None:
+				return
+			config = getattr(self, "_persistent_spell_pool_design_config", None)
+			if not isinstance(config, dict):
+				config = {}
+			config["use_test_spell_impl"] = True
+			config["spell_priorities"] = copy.deepcopy(priorities)
+			try:
+				self._persistent_spell_pool_design_config = copy.deepcopy(config)
+			except Exception:
+				self._persistent_spell_pool_design_config = dict(config)
+			ok = self._apply_spell_pool_config_to_runtime_environment(config)
+			if ok:
+				status_var.set("应用成功：测试端法术池已注入（跨局保持）")
+				self.right_info_panel.append_content("\n[UI] 玩法设计-法术：测试端法术池配置已应用（跨局保持）")
+			else:
+				status_var.set("已保存：将在后续加载 runtime env 时自动生效")
+				self.right_info_panel.append_content("\n[UI] 玩法设计-法术：测试端法术池配置已保存（将对后续对局生效）")
+			# 更新缓存为“已应用”表格值（便于来回切换）。
+			try:
+				self._spell_priority_cache_when_test_impl_enabled = _collect_priority_cache_from_vars()
+			except Exception:
+				pass
+			self.root.after(1800, lambda: status_var.set(""))
+			self._set_system_settings_dirty("design_spell_pool", False)
+
+		def _reset_to_test_default() -> None:
+			# 恢复默认：测试端独立默认法术池（不跟随后端实现）
+			_set_priority_vars_from_map(_get_test_default_priority_map())
+			# 更新缓存（但不落地应用）
+			try:
+				self._spell_priority_cache_when_test_impl_enabled = _collect_priority_cache_from_vars()
+			except Exception:
+				pass
+			self._set_system_settings_dirty("design_spell_pool", True)
+			status_var.set("已恢复默认（未应用）")
+			self.root.after(1800, lambda: status_var.set(""))
+
+		apply_btn = ttk.Button(btn_row, text="应用", command=_apply)
+		apply_btn.grid(row=0, column=2, sticky="e")
+		reset_btn = ttk.Button(btn_row, text="恢复默认", command=_reset_to_test_default)
+		reset_btn.grid(row=0, column=3, sticky="e", padx=(8, 0))
+
+		def _set_widgets_enabled(enabled: bool) -> None:
+			state = "normal" if enabled else "disabled"
+			try:
+				for e in entries:
+					e.configure(state=state)
+			except Exception:
+				pass
+			try:
+				apply_btn.configure(state=state)
+			except Exception:
+				pass
+			try:
+				reset_btn.configure(state=state)
+			except Exception:
+				pass
+
+		def _update_note_text() -> None:
+			if bool(self.design_spell_use_test_impl_var.get()):
+				note_var.set(
+					"说明：这里用于配置各职业可用的法术池（测试端独立实现，不改后端文件）。\n"
+					"- 表格填优先级：0=不选；1~5=优先级（数字越小优先级越高）。\n"
+					"- 点击“应用”后：本局与后续对局生效。\n"
+					"- 行动中法术下拉框可选：按优先级选出前 N 个法术。\n"
+					"  N 的计算：非法师 N=intelligence//4 + 1；法师 N=2*(intelligence//4)+1。"
+				)
+			else:
+				note_var.set(
+					"当前未启用测试端法术实现：将走后端 SpellFactory.get_available_spells。\n"
+					"- 本页表格仅展示后端默认职业-法术池配置，且不可编辑。\n"
+					"- 后端当前规则（供对照）：可用法术数 = intelligence//5 + 1。"
+				)
+
+		def _apply_toggle_immediately() -> None:
+			enabled = bool(self.design_spell_use_test_impl_var.get())
+			# 更新持久配置中的开关（实时生效，不走 apply 按钮）
+			config = getattr(self, "_persistent_spell_pool_design_config", None)
+			if not isinstance(config, dict):
+				config = {}
+			config["use_test_spell_impl"] = bool(enabled)
+			# 切换显示/可交互性
+			if enabled:
+				# 恢复测试端表格值
+				_restore_priority_vars_from_cache(self._spell_priority_cache_when_test_impl_enabled)
+			else:
+				# 保存当前测试端表格值到缓存，并展示后端默认
+				try:
+					self._spell_priority_cache_when_test_impl_enabled = _collect_priority_cache_from_vars()
+				except Exception:
+					pass
+				_set_priority_vars_from_map(_get_backend_default_priority_map())
+			try:
+				self._persistent_spell_pool_design_config = copy.deepcopy(config)
+			except Exception:
+				self._persistent_spell_pool_design_config = dict(config)
+			_set_widgets_enabled(bool(enabled))
+			_update_note_text()
+			# 立即对当前 runtime env 生效（若未加载则只保存，后续自动重应用）。
+			ok = self._apply_spell_pool_config_to_runtime_environment(config)
+			if enabled:
+				status_var.set("已启用：测试端法术实现（即时生效）" if ok else "已启用：将在后续加载 runtime env 时生效")
+			else:
+				status_var.set("已关闭：走后端法术实现（即时生效）" if ok else "已关闭：将在后续加载 runtime env 时生效")
+			self.root.after(1800, lambda: status_var.set(""))
+
+		# 初次渲染时同步一次 UI 状态。
+		_update_note_text()
+		_set_widgets_enabled(bool(self.design_spell_use_test_impl_var.get()))
+		# 绑定实时开关（仅一次，避免切页重复 trace 导致回调叠加）
+		if not bool(getattr(self, "_design_spell_use_test_impl_trace_bound", False)):
+			try:
+				self.design_spell_use_test_impl_var.trace_add("write", lambda *_a: _apply_toggle_immediately())
+				self._design_spell_use_test_impl_trace_bound = True
+			except Exception:
+				pass
 
 	def _apply_near_death_config_to_runtime_environment(self, config: dict[str, Any]) -> bool:
 		if self.controller.runtime_source != "runtime_env":
@@ -5627,8 +7439,18 @@ class MainUI:
 			return False
 		setattr(env, "_ui_near_death_config", config.get("near_death", {}) if isinstance(config, dict) else {})
 		# 安装测试端玩法 hook（仅一次），并在 hook 内动态读取 _ui_near_death_config。
+		def _queue_near_death_msg(msg: str) -> None:
+			try:
+				pending = getattr(env, "_ui_pending_info_messages", None)
+				if not isinstance(pending, list):
+					pending = []
+					setattr(env, "_ui_pending_info_messages", pending)
+				pending.append(str(msg))
+			except Exception:
+				return
+
 		try:
-			ensure_test_mock_gameplay_installed(env, logger=lambda msg: self.right_info_panel.append_content(f"\n{msg}"))
+			ensure_test_mock_gameplay_installed(env, logger=_queue_near_death_msg)
 		except Exception:
 			try:
 				ensure_test_mock_gameplay_installed(env)
@@ -5739,9 +7561,15 @@ class MainUI:
 				if self.design_attribute_status_var is not None:
 					self.design_attribute_status_var.set("未生效：当前未加载 runtime env")
 				return
+			# 保存“已应用快照”，用于关闭窗口时丢弃未应用修改的 UI 回滚。
+			try:
+				self._applied_design_attribute_talent_gradients_snapshot = copy.deepcopy(config)
+			except Exception:
+				self._applied_design_attribute_talent_gradients_snapshot = dict(config)
 			if self.design_attribute_status_var is not None:
 				self.design_attribute_status_var.set("应用成功：派生上限梯度已注入（本局生效）")
 				self.root.after(1800, lambda: self.design_attribute_status_var.set(""))
+			self._set_system_settings_dirty("design_attribute", False)
 			try:
 				self.right_info_panel.append_content("\n[UI] 玩法设计-属性：派生上限梯度已应用（本局临时生效）")
 			except Exception:
@@ -5843,14 +7671,40 @@ class MainUI:
 		wrapper = ttk.Frame(parent)
 		wrapper.grid(row=0, column=0, sticky="nsew")
 		wrapper.columnconfigure(0, weight=1)
-		wrapper.rowconfigure(2, weight=1)
+		wrapper.rowconfigure(1, weight=1)
 
-		intro = (
-			"这里将用于展示：当前版本/变更摘要/调试开关说明/已注入规则快照等开发向信息。\n"
-			"（后续可加入：显示 env hook 状态、快速跳转到 devel_details 文档等）"
-		)
 		ttk.Label(wrapper, text="开发信息", font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 8))
-		ttk.Label(wrapper, text=intro, justify="left", foreground="#4b5563").grid(row=1, column=0, sticky="nw")
+
+		path = os.path.join(os.path.dirname(__file__), "assets", "dev_info.txt")
+		path_var = tk.StringVar(value=f"文件：{path}")
+		top = ttk.Frame(wrapper)
+		top.grid(row=0, column=1, sticky="e")
+		text = tk.Text(wrapper, wrap="word", font=("Microsoft YaHei UI", 10), relief="flat")
+		sb = ttk.Scrollbar(wrapper, orient="vertical", command=text.yview)
+		text.configure(yscrollcommand=sb.set)
+		text.grid(row=1, column=0, sticky="nsew")
+		sb.grid(row=1, column=1, sticky="ns")
+		footer = ttk.Label(wrapper, textvariable=path_var, foreground="#6b7280")
+		footer.grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+		def _reload() -> None:
+			text.configure(state="normal")
+			text.delete("1.0", "end")
+			try:
+				with open(path, "r", encoding="utf-8") as f:
+					content = f.read()
+			except FileNotFoundError:
+				content = (
+					"未找到开发信息文件。\n\n"
+					"请在 ui/assets/dev_info.txt 中编写内容，然后点击“刷新”。\n"
+				)
+			except Exception as e:
+				content = f"读取开发信息失败：{e}"
+			text.insert("end", content)
+			text.configure(state="disabled")
+
+		ttk.Button(top, text="刷新", command=lambda: _reload()).grid(row=0, column=0, sticky="e")
+		_reload()
 
 	def _center_popup_window(self, window: tk.Toplevel) -> None:
 		"""将弹窗居中到主窗口。"""
@@ -8152,7 +10006,15 @@ class MainUI:
 				self.root.after_cancel(self.attribute_piece_apply_status_job)
 			except Exception:
 				pass
-		self.attribute_piece_apply_status_job = self.root.after(2000, lambda: label.configure(text=""))
+
+		def _clear_if_exists() -> None:
+			try:
+				if label is not None and bool(label.winfo_exists()):
+					label.configure(text="")
+			except Exception:
+				pass
+
+		self.attribute_piece_apply_status_job = self.root.after(2000, _clear_if_exists)
 
 	def _safe_int(self, value: str, default: int = 0) -> int:
 		try:

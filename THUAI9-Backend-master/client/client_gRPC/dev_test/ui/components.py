@@ -920,6 +920,7 @@ class ChessboardPanel(ttk.LabelFrame):
 			y = piece.get("y")
 			team = piece.get("team")
 			label = piece.get("label")
+			corner_marker = piece.get("corner_marker")
 			is_current = bool(piece.get("is_current", False))
 			if not isinstance(x, int) or not isinstance(y, int):
 				continue
@@ -980,6 +981,20 @@ class ChessboardPanel(ttk.LabelFrame):
 						font=("Microsoft YaHei UI", font_size, "bold"),
 						justify="center",
 					)
+
+			# 右上角状态角标（白色）：用于 💀 / 😇 等。
+			if isinstance(corner_marker, str) and corner_marker.strip():
+				# 需求：更靠近右上角一点；必要时略缩小；颜色改为黄色。
+				pad = max(1.0, self.cell_size * 0.03)
+				marker_size = max(9, int(self.cell_size * 0.20))
+				self.canvas.create_text(
+					cx1 - pad,
+					cy0 + pad,
+					text=str(corner_marker).strip(),
+					fill="#facc15",
+					font=("Microsoft YaHei UI", marker_size, "bold"),
+					anchor="ne",
+				)
 
 	def _draw_trap_markers(self) -> None:
 		if self.cell_size <= 0:

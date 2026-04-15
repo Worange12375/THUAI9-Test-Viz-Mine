@@ -54,7 +54,9 @@ dev_test/
 1. 进入目录：
    - `cd THUAI9-Backend-master/client/client_gRPC/dev_test`
 2. 运行项目：
-   - `python main.py`
+   - 直接运行 `python ui/main_ui.py`（后续会整合到 main.py）
+   - `python main.py`（仅终端界面）
+
 
 ### 运行流程
 - 程序先由 `logic/controller.py` 调用 `core/data_provider.py` 的 `DataProvider.get_game_data(prefer_backend=True)`
